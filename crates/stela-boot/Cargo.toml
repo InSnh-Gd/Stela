@@ -32,7 +32,10 @@ default = []
 diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
-nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+nvk = ["dep:stela-mesa", "stela-drivers/metal-linked", "stela-drivers/nouveau-port"]
+# The xe port: Linux's Intel driver for this PC's own Xe3P GPU. An image
+# carries one port at a time, so this and `nvk` cannot be selected together.
+xe = ["stela-drivers/xe-port"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }
@@ -44,7 +47,7 @@ stela-tls = { path = "../stela-tls" }
 stela-formats = { path = "../stela-formats", default-features = false }
 uefi = { version = "0.41", default-features = false, features = ["alloc"] }
 stela-boot-core = { path = "../stela-boot-core", features = ["native-acpi"] }
-stela-drivers = { path = "../stela-drivers", features = ["native-acpi", "nouveau-port"] }
+stela-drivers = { path = "../stela-drivers", features = ["native-acpi"] }
 stela-soc = { path = "../stela-soc", default-features = false }
 stela-mesa = { path = "../stela-mesa", optional = true }
 stela-runtime = { path = "../stela-runtime", default-features = false }

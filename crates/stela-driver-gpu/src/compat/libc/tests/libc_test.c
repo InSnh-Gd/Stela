@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <link.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -258,6 +259,22 @@ static void test_refusals(void)
 	errno = 0;
 	CHECK(poll(&file, 1, 0) == -1);
 	CHECK(errno == ENOSYS);
+}
+
+static int count_loaded_object(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)info;
+	(void)size;
+	(*(unsigned *)data)++;
+	return 0;
+}
+
+static void test_loaded_objects(void)
+{
+	unsigned objects = 0;
+
+	CHECK(dl_iterate_phdr(count_loaded_object, &objects) == 0);
+	CHECK(objects == 0);
 }
 
 static void test_division(void)
@@ -658,6 +675,7 @@ int main(void)
 	test_anonymous_files();
 	test_meminfo();
 	test_refusals();
+	test_loaded_objects();
 	test_division();
 	test_system();
 	test_wide();

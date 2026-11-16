@@ -1,7 +1,7 @@
 //! nouveau: the `nouveau-y` composite of its own Kbuild, compiled unchanged in
 //! Stela's Linux environment, and the kernel services it imports that the
 //! environment does not yet supply.
-use super::kbuild::{Config, Kbuild};
+use super::kbuild::{Config, Include, Kbuild};
 use super::native::{self, Linux};
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
 use std::{
@@ -20,8 +20,11 @@ const MODULE: Module<'static> = Module {
     name: "nouveau",
     file: "drivers/gpu/drm/nouveau/nouveau",
 };
-/// Kbuild's composite: nouveau's DRM layer over NVIF and NVKM.
-const COMPOSITES: [&str; 1] = ["nouveau"];
+/// Kbuild's composites: nouveau's DRM layer over NVIF and NVKM. The encoder
+/// modules beside them are separate Kconfig symbols nouveau references not.
+const COMPOSITES: [&str; 3] = ["nouveau", "nvif", "nvkm"];
+/// The Kbuild variables of modules nouveau's own lists do not reference.
+const UNREFERENCED: [&str; 3] = ["obj-", "ch7006-", "sil164-"];
 
 /// What the compiler itself calls, which every platform's runtime supplies.
 const RUNTIME: [&str; 4] = ["memcpy", "memmove", "memset", "memcmp"];
@@ -80,8 +83,14 @@ fn initcalls_unit() -> Unit {
 pub fn port(linux: &mut Linux) {
     let config = Config::parse(&fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header"))
         .unwrap_or_else(|error| panic!("{AUTOCONF}: {error}"));
-    let kbuild =
-        Kbuild::read(Path::new(NOUVEAU), &config).unwrap_or_else(|error| panic!("{error}"));
+    let kbuild = Kbuild::read(Path::new(NOUVEAU), "Kbuild", &config, &COMPOSITES)
+        .unwrap_or_else(|error| panic!("{error}"));
+    for line in &kbuild.ignored {
+        assert!(
+            UNREFERENCED.iter().any(|prefix| line.starts_with(prefix)),
+            "nouveau's Kbuild gained {line}"
+        );
+    }
     for file in &kbuild.files {
         println!("cargo:rerun-if-changed={}", file.display());
     }
@@ -99,11 +108,11 @@ pub fn port(linux: &mut Linux) {
     let includes = kbuild
         .includes
         .iter()
-        .map(|directory| {
-            let relative = directory
-                .strip_prefix(NOUVEAU)
-                .expect("Kbuild includes lie in nouveau's tree");
-            Path::new("nouveau").join(relative).display().to_string()
+        .map(|include| {
+            let Include::Source(below) = include else {
+                panic!("nouveau's Kbuild adds {include:?}")
+            };
+            Path::new("nouveau").join(below).display().to_string()
         })
         .collect::<Vec<_>>();
     let includes = includes.iter().map(String::as_str).collect::<Vec<_>>();
@@ -137,7 +146,7 @@ pub fn port(linux: &mut Linux) {
             .flat_map(|compiling| compiling.join().expect("a compiling thread"))
             .collect::<Vec<_>>()
     });
-    let mut captured = linux.take_captured();
+    let mut captured = linux.cohort();
     let environment_count = captured.len();
     let compiler = initcalls::compiler(&build);
     let placement = initcalls::Placement::new(

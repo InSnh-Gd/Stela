@@ -179,6 +179,7 @@ enum Consumer {
     IntelRsa,
     Wifi,
     Nouveau,
+    Xe,
 }
 
 const fn realtek(
@@ -929,6 +930,99 @@ pub const GSP: &[Recipe] = &[
     ),
 ];
 
+/// The linux-firmware commit holding the images the xe port loads on a
+/// Panther Lake (Xe3P) GPU: GuC 70.72.1 and HuC 10.3.3, the pair
+/// linux-firmware names `ptl`. Its GuC is the image this PC's Arc B390 runs
+/// (newer commits hold 70.83.0 under the same name).
+pub const XE_REVISION: &str = "4291fa65d3055297136cad6370e54113e27662ff";
+
+const XE_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: XE_REVISION,
+    member: "LICENSES/LICENSE.xe",
+    length: 2041,
+    sha256: "26b3c946f1f378ff25bb3bb7c365d108a2bc0bf08619e5e08bc0e4f9aaa6ee1e",
+};
+
+const fn xe(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: XE_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &XE_LICENSE,
+        consumer: Consumer::Xe,
+    }
+}
+
+/// Every image linux-firmware holds for the xe port, which is the graphical
+/// microcontroller firmware xe starts the GT with and the video firmware it
+/// takes beside it.
+pub const INTEL_XE: &[Recipe] = &[
+    xe(
+        "xe/ptl_guc_70.bin",
+        365376,
+        "ac42861c62b69f19923d9a69d971fb849921585a01924e14c0e8ac679d7cde81",
+    ),
+    xe(
+        "xe/ptl_huc.bin",
+        651264,
+        "93e9aaf15362630441042a31fe864f9e4df76b401ada91de6df64e0f6b8adbca",
+    ),
+];
+
+/// The xe platform linux-firmware names an Intel display controller's files
+/// after, by the PCI device ID ranges Intel gives each Xe3 family: `ptl` for
+/// Panther Lake, whose IDs `ptl_ids` in the driver's own PCI table lists.
+pub fn xe_platform(device: u16) -> Option<&'static str> {
+    Some(match device {
+        0xb080..=0xb087 | 0xb08f | 0xb090 | 0xb0a0 | 0xb0b0 => "ptl",
+        _ => return None,
+    })
+}
+
+/// The images xe loads on the GPU with PCI device ID `device`, under the
+/// binding the USB takes when it has none for the observed adapter. Returns
+/// whether the adapter is one whose files are now required.
+pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<bool, Error> {
+    let Some(platform) = xe_platform(device) else {
+        return Ok(false);
+    };
+    let target = Target {
+        driver: "xe",
+        hardware: "intel",
+        revision: "linux-firmware",
+        board: None,
+    };
+    let prefix = format!("xe/{platform}_");
+    let mut found = false;
+    for recipe in INTEL_XE
+        .iter()
+        .filter(|recipe| recipe.image.member.starts_with(&prefix))
+    {
+        inventory.observe(Requirement {
+            name: recipe.image.member,
+            target,
+            minimum_bytes: 1,
+        })?;
+        found = true;
+    }
+    Ok(found)
+}
+
+/// xe's request for one of its files, under the binding `require_xe` writes.
+fn select_xe(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != "intel" || request.target.revision != "linux-firmware" {
+        return None;
+    }
+    INTEL_XE
+        .iter()
+        .find(|recipe| recipe.image.member == request.name)
+}
+
 /// The chip whose `gsp` directory linux-firmware's `WHENCE` links `chip`'s to.
 fn gsp_directory(chip: &str) -> Option<&'static str> {
     Some(match chip {
@@ -1436,6 +1530,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
+        "xe" => select_xe(request),
         _ => None,
     }
 }
@@ -2284,3 +2379,71 @@ mod tests {
 
 #[cfg(test)]
 mod wireless_resource_tests;
+
+#[cfg(test)]
+mod xe_tests {
+    use super::*;
+
+    /// A Panther Lake GPU asks for the GuC and HuC images under the pin the
+    /// bundle and the boot both use, and nothing else asks for them.
+    #[test]
+    fn require_xe_observes_the_panther_lake_pair_exactly() {
+        for device in [0xb080, 0xb087, 0xb08f, 0xb090, 0xb0a0, 0xb0b0] {
+            let mut inventory = Inventory::default();
+            assert!(require_xe(&mut inventory, device).unwrap(), "{device:04x}");
+            let names: Vec<&str> = inventory
+                .requests()
+                .iter()
+                .map(|request| request.name.as_str())
+                .collect();
+            assert_eq!(names, ["xe/ptl_guc_70.bin", "xe/ptl_huc.bin"]);
+            for request in inventory.requests() {
+                assert_eq!(request.target.driver, "xe");
+                assert_eq!(request.target.hardware, "intel");
+                assert_eq!(request.target.revision, "linux-firmware");
+            }
+            let plan = Plan::select(&inventory).unwrap();
+            assert_eq!(plan.selections().len(), 2);
+            for selection in plan.selections() {
+                assert_eq!(selection.recipe.image.revision, XE_REVISION);
+                assert_eq!(selection.recipe.license, &XE_LICENSE);
+                assert!(matches!(selection.recipe.consumer, Consumer::Xe));
+                assert_eq!(selection.request.name, selection.recipe.image.member);
+            }
+            // The two images and the notice their manifest names.
+            assert_eq!(plan.artifacts().len(), 3);
+        }
+    }
+
+    /// An Intel display controller xe's table does not name asks for nothing,
+    /// and a file xe does not load binds to no recipe.
+    #[test]
+    fn unnamed_intel_parts_and_unpinned_names_ask_for_nothing() {
+        for device in [0x1234, 0xb088, 0xa780] {
+            let mut inventory = Inventory::default();
+            assert!(!require_xe(&mut inventory, device).unwrap(), "{device:04x}");
+            assert!(inventory.requests().is_empty());
+        }
+        for (name, hardware, revision) in [
+            ("xe/ptl_gsc_1.bin", "intel", "linux-firmware"),
+            ("xe/ptl_guc_70.bin", "intel", "linux-firmware-2026"),
+            ("xe/ptl_guc_70.bin", "pci:8086:b080", "linux-firmware"),
+            ("xe/bmg_guc_70.bin", "intel", "linux-firmware"),
+        ] {
+            let request = Request {
+                name: name.into(),
+                target: super::super::requirements::Identity {
+                    driver: "xe".into(),
+                    hardware: hardware.into(),
+                    revision: revision.into(),
+                    board: None,
+                },
+                minimum_bytes: 1,
+            };
+            assert!(
+                select_xe(&request).is_none(),
+                "{name} {hardware} {revision}"
+            );
+        }
+    }
+}

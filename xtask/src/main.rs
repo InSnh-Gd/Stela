@@ -35,8 +35,15 @@ enum Task {
         #[arg(long)]
         low_memory: bool,
     },
-    /// Build the release `stela` with its matching `stela.efi` embedded.
-    Dist,
+    /// Build the release `stela` with its matching `stela.efi` embedded,
+    /// carrying the GPU port `--port` names.
+    Dist {
+        /// Which GPU port the embedded `stela.efi` carries. A PC with an
+        /// NVIDIA GPU takes `nvk` (the default); one with Intel's Xe3P
+        /// graphics takes `xe`.
+        #[arg(long, value_enum, default_value_t = boot::Port::Nvk)]
+        port: boot::Port,
+    },
     /// Run ignored oracle tests whose declared inputs are present and write a dated report.
     Oracles(oracles::Oracles),
     /// Build, run and debug the UEFI mount in x86 QEMU.
@@ -73,7 +80,7 @@ enum Task {
 fn main() -> ExitCode {
     let result = match Cli::parse().task {
         Task::Check { fix, low_memory } => check::run(fix, low_memory).map(|()| ExitCode::SUCCESS),
-        Task::Dist => dist::run().map(|()| ExitCode::SUCCESS),
+        Task::Dist { port } => dist::run(port).map(|()| ExitCode::SUCCESS),
         Task::Oracles(task) => task.run().map(|()| ExitCode::SUCCESS),
         Task::Boot(command) => boot::run(command),
         Task::Gpu(command) => gpu::run(command).map(|()| ExitCode::SUCCESS),

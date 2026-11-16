@@ -25,6 +25,13 @@ notrace u64 sched_clock(void)
 	return (u64)now;
 }
 
+ktime_t ktime_get_raw(void)
+{
+	/* The owner reports one monotonic clock, which already excludes time
+	 * spent suspended, so the raw clock is that read. */
+	return ktime_get();
+}
+
 int stela_linux_boottime_ns(s64 *now)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();

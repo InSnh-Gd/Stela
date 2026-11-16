@@ -1109,7 +1109,13 @@ impl MemoryExporter for Exporter {
 }
 
 fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
-    let driver = &gpu.stack.vulkan;
+    // A stack whose port drives the GPU but links no Vulkan driver for it,
+    // which the Intel stack is today, has no Metal device to serve.
+    let Some(driver) = gpu.stack.vulkan.as_ref() else {
+        return Err(OpenError::Device(Error::Invalid(
+            "this stack links no Vulkan driver for its Metal device",
+        )));
+    };
     let compiler = |physical| {
         // SAFETY: the driver's own physical device, whose options last as long.
         let options = unsafe { (driver.nir_options)(physical) };

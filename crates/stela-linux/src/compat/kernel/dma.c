@@ -37,6 +37,27 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page, size_t offs
 	return dma_map_phys(dev, page_to_phys(page) + offset, size, dir, attrs);
 }
 
+/* A resource's own physical range, such as a device BAR or local memory,
+ * mapped for a device that is not the one that owns it, following
+ * kernel/dma/mapping.c. Upstream also refuses an address that is ordinary
+ * RAM; what Stela has granted as pages is its owner's knowledge, and the
+ * owner's mapping service is the one that refuses it. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
+			    enum dma_data_direction dir, unsigned long attrs)
+{
+	if (!size || stela_linux_kernel_hosted())
+		return DMA_MAPPING_ERROR;
+	return dma_map_phys(dev, phys_addr, size, dir, attrs);
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+			enum dma_data_direction dir, unsigned long attrs)
+{
+	if (!size)
+		return;
+	dma_unmap_phys(dev, addr, size, dir, attrs);
+}
+
 void dma_unmap_page_attrs(struct device *dev, dma_addr_t addr, size_t size,
 			  enum dma_data_direction dir, unsigned long attrs)
 {

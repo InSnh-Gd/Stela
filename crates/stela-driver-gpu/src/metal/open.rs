@@ -14,6 +14,7 @@ use crate::{
         capabilities::Platform,
         device::Device,
         error::Error,
+        intel,
         nvidia,
         service::{Service, identity::DeviceEpoch},
         shader::Compiler,
@@ -84,6 +85,9 @@ pub struct Admission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     Nvidia(nvidia::Refusal),
+    /// The Intel stack's own refusal: the image links no Vulkan driver over
+    /// its xe port, so the GPU has no Metal device.
+    Intel(intel::Refusal),
 }
 
 /// The GPU the platform hands the Metal device.

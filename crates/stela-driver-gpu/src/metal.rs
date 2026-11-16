@@ -24,6 +24,7 @@ pub mod error;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;
+pub mod intel;
 pub mod kms;
 pub mod library;
 #[cfg(feature = "metal-vulkan")]

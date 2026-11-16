@@ -75,6 +75,10 @@ pub fn upstream_warnings(build: &mut cc::Build) {
     // version, which a compiler numbered apart from LLVM (Apple's) misses.
     // Compilers without the warning reject its name, so it is probed.
     build.flag_if_supported("-Wno-attribute-alias");
+    // Linux's typecheck() declares a variable of the checked expression's
+    // type. Clang 21 reports that when the type turns out to be a constant,
+    // as xe's u64_to_user_ptr() calls pass a `const` member.
+    build.flag_if_supported("-Wno-default-const-init-var-unsafe");
 }
 
 /// Clang reports nothing from system headers, not even a call to a service no
@@ -102,7 +106,13 @@ pub fn sources(directory: &str) -> Vec<PathBuf> {
         .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
         .collect::<Vec<_>>();
     sources.sort();
+    // The directory's own timestamp only moves when a file is added or
+    // removed, so every file is listed too: an edit inside one otherwise
+    // leaves its object in the archive stale.
     println!("cargo:rerun-if-changed={directory}");
+    for source in &sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
     sources
 }
 

@@ -664,12 +664,21 @@ impl Platform for Host {
         }
     }
 
-    fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void> {
-        self.map(
-            physical.len(),
-            |page| physical[page as usize],
-            Cache::WriteBack,
-        )
+    fn map_pages(&self, physical: &[u64], prot: u64) -> Option<*mut c_void> {
+        // The request's own cache bits pick the attribute, as the device
+        // mapping above does: `_PAGE_PWT` merges stores and `_PAGE_PCD` is
+        // uncached, and neither leaves the write-back pages a driver's own
+        // buffers are mapped through.
+        const PAGE_PWT: u64 = 1 << 3;
+        const PAGE_PCD: u64 = 1 << 4;
+        let cache = if prot & PAGE_PWT != 0 {
+            Cache::WriteCombining
+        } else if prot & PAGE_PCD != 0 {
+            Cache::Uncached
+        } else {
+            Cache::WriteBack
+        };
+        self.map(physical.len(), |page| physical[page as usize], cache)
     }
 
     unsafe fn unmap_pages(&self, address: *mut c_void, count: usize) {
@@ -1072,6 +1081,113 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
         .map_err(|_| ServiceError::Refused("the GPU firmware image names are invalid"))
 }
 
+/// The images xe asks for, which its own table names by the adapter's PCI
+/// device ID rather than by a register (`recipes::xe_platform`).
+#[cfg(feature = "xe")]
+fn select_intel_firmware(device: u16, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
+    use stela_loader::host_firmware::{recipes, requirements::Inventory};
+    let platform = recipes::xe_platform(device).ok_or(ServiceError::Refused(
+        "the GPU is no Intel part the xe port's firmware table names",
+    ))?;
+    let mut inventory = Inventory::default();
+    recipes::require_xe(&mut inventory, device)
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned xe recipe"))?;
+    firmware_from(&inventory, platform, catalog)
+}
+
+/// The images [`select_firmware`] and [`select_intel_firmware`] observed,
+/// bound to the exact names and target the driver asks for, or the refusal
+/// that says which of them the USB lacks. `label` names the part on the
+/// screen.
+#[cfg(feature = "xe")]
+fn firmware_from(
+    inventory: &stela_loader::host_firmware::requirements::Inventory,
+    label: &str,
+    catalog: Arc<Catalog>,
+) -> Result<PciFirmware, ServiceError> {
+    use stela_loader::host_firmware::{bundle, recipes};
+    let name = label;
+    let mut names = Vec::new();
+    let request = inventory.requests().first().ok_or(ServiceError::Refused(
+        "the GPU has no pinned firmware recipe",
+    ))?;
+    let target = FirmwareTarget::new(
+        request.target.driver.clone(),
+        request.target.hardware.clone(),
+        request.target.revision.clone(),
+        request.target.board.clone(),
+    )
+    .map_err(|_| ServiceError::Refused("the GPU firmware target is invalid"))?;
+    let plan = recipes::Plan::select(inventory)
+        .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
+    // SAFETY: the reference count is never given back, so the catalog
+    // stays allocated for every image borrowed from it for the boot.
+    let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
+    let mut bindings = Vec::new();
+    let mut available = false;
+    for selection in plan.selections() {
+        let request = &selection.request;
+        // An exact binding, else the bundle's file by its pinned digest.
+        let found = match stored.load(request.view()) {
+            Err(error) if error.kind == FirmwareError::Missing => {
+                let name = bundle::name(selection.recipe.image.sha256);
+                match stored.load(stela_drivers::firmware::Requirement {
+                    name: &name,
+                    target: bundle::TARGET,
+                    minimum_bytes: request.minimum_bytes,
+                }) {
+                    Err(stored_error) if stored_error.kind == FirmwareError::Missing => Err(error),
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        if let Ok(image) = found {
+            bindings.push((image, request));
+        }
+        match found {
+            Ok(image) => {
+                selection
+                    .recipe
+                    .image
+                    .verify_digest(image.bytes().len(), image.sha256())
+                    .map_err(|_| {
+                        ServiceError::Refused(
+                            "the GPU firmware digest does not match its pinned recipe",
+                        )
+                    })?;
+                available = true;
+            }
+            Err(error) if error.kind == FirmwareError::Missing => (),
+            Err(error) => {
+                output::arguments(format_args!(
+                    "GPU {name}: firmware {} refused: {error:?}\n",
+                    request.name
+                ));
+                return Err(ServiceError::Refused(
+                    "the GPU firmware does not match its exact catalogue target",
+                ));
+            }
+        }
+        names.push(request.name.clone());
+    }
+    if !available {
+        output::arguments(format_args!(
+            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela repair` \
+             completes it\n"
+        ));
+        return Err(ServiceError::Refused(NO_FIRMWARE));
+    }
+    // Each file under the exact name and target xe asks for.
+    let catalog = Catalog::rebind_all(bindings.iter().map(|(image, request)| {
+        let view = request.view();
+        (*image, view.name, view.target)
+    }))
+    .map_err(|_| ServiceError::Refused("the GPU firmware cannot be bound to its requests"))?;
+    PciFirmware::new(target, Arc::new(catalog), names.into_boxed_slice())
+        .map_err(|_| ServiceError::Refused("the GPU firmware image names are invalid"))
+}
+
 /// A function claimed from probe, before Linux sees it.
 pub(super) struct Claimed {
     /// Whether this GPU may be the one showing the firmware's screen.
@@ -1168,14 +1284,21 @@ fn claim(
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if let Err(why) = gpu::cold::register_bar(function_bars[0], PAGE) {
-        output::arguments(format_args!(
-            "GPU {address} register BAR refused: {why:?} BAR0={:?}\n",
-            function_bars[0]
-        ));
-        return Err(ServiceError::Refused(
-            "the GPU's BAR 0 is not an assigned register window",
-        ));
+    match gpu::cold::register_bar(function_bars[0], PAGE) {
+        Ok(()) => {}
+        // Intel's register BAR, the graphics MMIO aperture, is marked
+        // prefetchable where nouveau's own is not: the bit names the register
+        // window for one port and not the other, so only NVIDIA's refuses it.
+        Err(gpu::cold::RegisterBar::Prefetchable) if stack.vendor == gpu::Vendor::Intel => {}
+        Err(why) => {
+            output::arguments(format_args!(
+                "GPU {address} register BAR refused: {why:?} BAR0={:?}\n",
+                function_bars[0]
+            ));
+            return Err(ServiceError::Refused(
+                "the GPU's BAR 0 is not an assigned register window",
+            ));
+        }
     }
     for (region, bar) in placement.regions.iter_mut().zip(function_bars) {
         let Some(
@@ -1247,8 +1370,15 @@ fn claim(
         ));
     }
     let boot0 = registers.read32(0).map_err(ServiceError::Mapping)?;
-    let firmware = select_firmware(boot0, catalog)?;
-    if let Some(chip) = gpu::nouveau_chip::Chip::from_boot0(boot0) {
+    let firmware = match stack.vendor {
+        // xe asks for its own images, named by the adapter's device ID.
+        #[cfg(feature = "xe")]
+        gpu::Vendor::Intel => select_intel_firmware(adapter.device, catalog)?,
+        _ => select_firmware(boot0, catalog)?,
+    };
+    if stack.vendor == gpu::Vendor::Nvidia
+        && let Some(chip) = gpu::nouveau_chip::Chip::from_boot0(boot0)
+    {
         crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip.name);
     }
     crate::host_inventory::text(
@@ -1595,7 +1725,9 @@ pub(super) fn claim_all(
             )),
         }
     }
-    if !cfg!(feature = "nvk") {
+    // An image that carries no port leaves every GPU with its firmware and
+    // says so, rather than claiming a function no driver would bind.
+    if !cfg!(any(feature = "nvk", feature = "xe")) {
         let mut refused = Vec::new();
         for (_, adapter) in driven {
             let why = "this image has no GPU driver: build it with `cargo xtask boot build`";
@@ -1840,7 +1972,16 @@ pub(super) fn no_metal_device() -> Option<&'static str> {
     return gate::shared()
         .is_empty()
         .then_some("no GPU started; the lines above say why");
-    #[cfg(not(feature = "nvk"))]
+    // The xe port drives the host's Intel GPU for Linux and for the guest's
+    // own drivers, but the Metal device macOS asks for comes from a Vulkan
+    // driver linked into the image (NVK's route): the xe port's own, the
+    // Intel Vulkan driver, is not linked yet.
+    #[cfg(all(not(feature = "nvk"), feature = "xe"))]
+    return Some(
+        "this stela.efi carries the xe port, which drives the GPU, but not the Intel \
+         Vulkan driver its Metal device needs: the guest would start without one",
+    );
+    #[cfg(not(any(feature = "nvk", feature = "xe")))]
     Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
 }
 

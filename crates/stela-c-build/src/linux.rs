@@ -101,6 +101,11 @@ impl Environment {
             .define("__DISABLE_EXPORTS", None);
         for flag in [
             "-fms-extensions",
+            // Clang warns about the GNU and Microsoft extensions Linux builds
+            // with by default; Linux's own Makefile turns both off beside
+            // `-fms-extensions` (CC_FLAGS_DIALECT).
+            "-Wno-gnu",
+            "-Wno-microsoft-anon-tag",
             "-fshort-wchar",
             "-fno-strict-aliasing",
             "-fno-common",

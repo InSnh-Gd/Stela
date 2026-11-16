@@ -18,9 +18,16 @@ workspace = true
 [features]
 # Common native Linux kernel services; selecting this attaches no GPU.
 linux-kernel = ["dep:cc", "dep:stela-c-build", "stela-c-build/linux", "dep:stela-linux", "stela-linux/kernel"]
+# The DRM class environment: Linux's DRM core over the shared kernel services,
+# which every ported DRM driver is composed on. Selecting this attaches no GPU.
+drm-port = ["linux-kernel", "stela-c-build/linux-registry"]
 # nouveau's hardware resource manager (NVKM), compiled unchanged; it reaches
 # no device until the kernel services it imports are supplied.
-nouveau-port = ["linux-kernel", "stela-c-build/linux-registry"]
+# One port at a time: each projects the environment's registration units into
+# the one image its own class archive is linked from.
+nouveau-port = ["drm-port"]
+# Intel's xe kernel mode driver for Xe3P (Panther Lake / Arc B390).
+xe-port = ["drm-port"]
 # Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
 metal = ["dep:stela-contracts"]
 # The Metal device's native backend over a loaded Vulkan driver (NVK).

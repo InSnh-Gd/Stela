@@ -2,6 +2,7 @@
 /* Linux's PCI core. Stela's own PCI owners enumerate, power and map
  * functions; Linux drivers match against their tables and reach the function
  * through the pci_ops the owner gives its bus. */
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -32,8 +33,7 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids, struct
 	return NULL;
 }
 
-/* Managed enabling and wake configuration, which no selected driver uses. */
-STELA_UNSUPPORTED(int, pcim_enable_device, struct pci_dev *)
+/* Wake configuration, which Stela leaves to the firmware. */
 STELA_UNSUPPORTED(int, pci_wait_for_pending_transaction, struct pci_dev *)
 STELA_UNSUPPORTED(int, pci_wake_from_d3, struct pci_dev *, bool)
 
@@ -492,6 +492,192 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
 {
 	iounmap(rom);
 	pci_disable_rom(pdev);
+}
+
+/* What a device's teardown undoes when its driver only managed the enable,
+ * following drivers/pci/pci.c. */
+static void pcim_disable(void *data)
+{
+	pci_disable_device(data);
+}
+
+int pcim_enable_device(struct pci_dev *dev)
+{
+	int error = pci_enable_device(dev);
+
+	if (error)
+		return error;
+	return devm_add_action_or_reset(&dev->dev, pcim_disable, dev);
+}
+
+/* Mapping a function's BARs, following lib/pci_iomap.c. A window Stela's
+ * owner gave the device maps wherever the driver asks for it; a BAR that asks
+ * for I/O port space instead has no mapping here. */
+void __iomem *pci_iomap_range(struct pci_dev *dev, int bar, unsigned long offset,
+			      unsigned long maxlen)
+{
+	resource_size_t start = pci_resource_start(dev, bar);
+	resource_size_t len = pci_resource_len(dev, bar);
+	unsigned long flags = pci_resource_flags(dev, bar);
+
+	if (len <= offset || !start)
+		return NULL;
+	len -= offset;
+	start += offset;
+	if (maxlen && len > maxlen)
+		len = maxlen;
+	if (flags & IORESOURCE_IO) {
+		stela_linux_unsupported("I/O port BAR mappings");
+		return NULL;
+	}
+	if (flags & IORESOURCE_MEM)
+		return ioremap(start, len);
+	return NULL;
+}
+
+void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long maxlen)
+{
+	return pci_iomap_range(dev, bar, 0, maxlen);
+}
+
+void pci_iounmap(struct pci_dev *dev, void __iomem *addr)
+{
+	(void)dev;
+	if (addr)
+		iounmap(addr);
+}
+
+/* The bus window Stela's owner registered, following drivers/pci/bus.c. The
+ * extra window list that file keeps beside these is private to it, and Stela
+ * has one place for a bus's windows. */
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
+{
+	if (n < PCI_BRIDGE_RESOURCE_NUM)
+		return bus->resource[n];
+	return NULL;
+}
+
+/* Wakeup is the firmware's while Stela owns no wake state for the function,
+ * following drivers/pci/pci.c's reading of the same fields. */
+bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
+{
+	if (!dev->pm_cap || state < PCI_D0 || state > PCI_D3hot)
+		return false;
+	return !!(dev->pme_support & (1 << state));
+}
+
+/* The resizable BAR size encoding of PCIe r6.2 sec. 7.8.6.3, following
+ * drivers/pci/rebar.c. */
+#define PCI_REBAR_MIN_SIZE ((resource_size_t)SZ_1M)
+
+int pci_rebar_bytes_to_size(u64 bytes)
+{
+	int minimum = ilog2(PCI_REBAR_MIN_SIZE);
+
+	return max(ilog2(roundup_pow_of_two(bytes)), minimum) - minimum;
+}
+
+resource_size_t pci_rebar_size_to_bytes(int size)
+{
+	return 1ULL << (size + ilog2(PCI_REBAR_MIN_SIZE));
+}
+
+/* The control register for one BAR, or the reason there is none. Only the
+ * function's own capability is read: the extended capability list is one
+ * Stela's enumeration does not walk yet, so pdev->rebar_cap stays zero and
+ * every driver sees a function with no resizable BARs. */
+static int pci_rebar_position(struct pci_dev *dev, int bar)
+{
+	unsigned int position, bars, index;
+	u32 control;
+
+	position = dev->rebar_cap;
+	if (!position)
+		return -ENOTSUPP;
+	if (pci_read_config_dword(dev, (int)(position + PCI_REBAR_CTRL), &control))
+		return -EIO;
+	bars = (unsigned int)FIELD_GET(PCI_REBAR_CTRL_NBAR_MASK, control);
+	for (index = 0; index < bars; index++, position += 8) {
+		if (pci_read_config_dword(dev, (int)(position + PCI_REBAR_CTRL), &control))
+			return -EIO;
+		if (FIELD_GET(PCI_REBAR_CTRL_BAR_IDX, control) == bar)
+			return (int)position;
+	}
+	return -ENOENT;
+}
+
+u64 pci_rebar_get_possible_sizes(struct pci_dev *dev, int bar)
+{
+	u32 capability;
+	int position = pci_rebar_position(dev, bar);
+
+	if (position < 0)
+		return 0;
+	if (pci_read_config_dword(dev, (int)(position + PCI_REBAR_CAP), &capability))
+		return 0;
+	return FIELD_GET(PCI_REBAR_CAP_SIZES, capability);
+}
+
+bool pci_rebar_size_supported(struct pci_dev *dev, int bar, int size)
+{
+	if (size < 0 || size > ilog2(SZ_128T) - ilog2(PCI_REBAR_MIN_SIZE))
+		return false;
+	return BIT(size) & pci_rebar_get_possible_sizes(dev, bar);
+}
+
+int pci_rebar_get_max_size(struct pci_dev *dev, int bar)
+{
+	u64 sizes = pci_rebar_get_possible_sizes(dev, bar);
+
+	return sizes ? (int)__fls(sizes) : -ENOENT;
+}
+
+/* A resized BAR needs its bridge window reassigned, which Stela's owner does
+ * and Stela does not: the request is refused as a function without the
+ * capability is, following drivers/pci/setup-res.c. */
+int pci_resize_resource(struct pci_dev *dev, int bar, int size, int exclude_bars)
+{
+	(void)dev;
+	(void)bar;
+	(void)size;
+	(void)exclude_bars;
+	return -ENOTSUPP;
+}
+
+/* Stela's owner moves a function's interrupt from its line to one message,
+ * which is the MSI case. Following drivers/pci/msi/api.c: a request for more
+ * than the owner moves, or for a table it would have to program itself, is
+ * refused rather than served with an invented answer. */
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs,
+			  unsigned int max_vecs, unsigned int flags)
+{
+	if (!min_vecs || min_vecs > max_vecs)
+		return -EINVAL;
+	if (!(flags & PCI_IRQ_MSI) || (flags & PCI_IRQ_MSIX) || min_vecs > 1)
+		return -ENOSPC;
+	int error = pci_enable_msi(dev);
+
+	return error ? error : 1;
+}
+
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	if (nr || !dev->msi_enabled)
+		return -EINVAL;
+	return (int)dev->irq;
+}
+
+int pci_msix_vec_count(struct pci_dev *dev)
+{
+	u16 control;
+
+	/* Stela's enumeration does not record the MSI-X capability, so a
+	 * function reports none: the owner moves one message, not a table. */
+	if (!dev->msix_cap)
+		return -EINVAL;
+	if (pci_read_config_word(dev, (int)(dev->msix_cap + PCI_MSIX_FLAGS), &control))
+		return -EIO;
+	return (control & PCI_MSIX_FLAGS_QSIZE) + 1;
 }
 
 #ifdef STELA_LINUX_PCI_TEST

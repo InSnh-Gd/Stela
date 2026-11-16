@@ -6,10 +6,11 @@
  * Copyright (c) 2006 Novell, Inc.
  */
 /* Linux's device model, following Linux
- * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c, class.c and
- * devres.c. Stela's owners create and attach devices, and nothing reads
- * sysfs: adding a device only keeps its parent alive, a class is its name and
- * its attribute files do not exist. */
+ * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c and class.c,
+ * over drivers/base/devres.c, which is compiled unchanged. Stela's owners
+ * create and attach devices, and nothing reads sysfs: adding a device only
+ * keeps its parent alive, a class is its name and its attribute files do not
+ * exist. */
 #include <linux/component.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -118,49 +119,15 @@ void device_unregister(struct device *dev)
 	put_device(dev);
 }
 
-/* A driver's managed actions, undone last first when it detaches. */
-struct managed_action {
-	struct list_head node;
-	void (*action)(void *);
-	void *data;
-};
+/* drivers/base/base.h keeps this one to the driver core's own files, and this
+ * is one of them. */
+int devres_release_all(struct device *dev);
 
-int __devm_add_action(struct device *dev, void (*action)(void *), void *data, const char *name)
-{
-	(void)name;
-	struct managed_action *managed = kmalloc_obj(*managed);
-
-	if (!managed)
-		return -ENOMEM;
-	managed->action = action;
-	managed->data = data;
-	list_add(&managed->node, &dev->devres_head);
-	return 0;
-}
-
-void devm_release_action(struct device *dev, void (*action)(void *), void *data)
-{
-	struct managed_action *managed;
-
-	list_for_each_entry(managed, &dev->devres_head, node)
-		if (managed->action == action && managed->data == data) {
-			list_del(&managed->node);
-			action(data);
-			kfree(managed);
-			return;
-		}
-	WARN_ON(1);
-}
-
+/* A driver's managed resources, undone last first when it detaches. The list
+ * itself is upstream's devres.c. */
 void stela_linux_devres_release(struct device *dev)
 {
-	struct managed_action *managed, *next;
-
-	list_for_each_entry_safe(managed, next, &dev->devres_head, node) {
-		list_del(&managed->node);
-		managed->action(managed->data);
-		kfree(managed);
-	}
+	devres_release_all(dev);
 }
 
 int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
@@ -215,6 +182,29 @@ ssize_t show_class_attr_string(const struct class *class, const struct class_att
 {
 	(void)class;
 	return sprintf(buf, "%s\n", container_of(attr, struct class_attribute_string, attr)->str);
+}
+
+/* Attribute files, which Stela's device model has none of: adding one keeps
+ * nothing, and a caller that only wanted its attribute readable sees the
+ * success of a device with no sysfs. */
+int device_create_file(struct device *dev, const struct device_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+	return 0;
+}
+
+void device_remove_file(struct device *dev, const struct device_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+}
+
+int devm_device_add_group(struct device *dev, const struct attribute_group *group)
+{
+	(void)dev;
+	(void)group;
+	return 0;
 }
 
 /* Components join an aggregate device when its master registers. Stela's

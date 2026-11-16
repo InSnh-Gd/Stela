@@ -14,8 +14,12 @@ pub mod metal;
 #[cfg(feature = "nouveau-port")]
 pub mod nouveau;
 
+#[cfg(feature = "xe-port")]
+pub mod xe;
+
 pub mod cold;
 pub mod gsp_perf;
+pub mod intel_chip;
 pub mod nouveau_chip;
 pub mod stack;
 
@@ -107,7 +111,10 @@ impl Adapter {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
             Vendor::Amd => "AMDGPU is not ported to Stela",
-            Vendor::Intel => "Intel i915/xe are not ported to Stela",
+            Vendor::Intel if cfg!(feature = "xe-port") => {
+                "this image carries the xe port, and the Intel GPU was not bound"
+            }
+            Vendor::Intel => "Intel Xe needs the xe port, which this image does not carry",
             Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
         }
     }

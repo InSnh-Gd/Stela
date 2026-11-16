@@ -4,7 +4,7 @@ use std::path::Path;
 use std::{env, path::PathBuf};
 #[cfg(feature = "linux-kernel")]
 use stela_c_build::linux_build::{archive, linux_archive, out_dir, sources};
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "drm-port")]
 use stela_c_build::{
     linux_build::{upstream_build, upstream_warnings},
     linux_capture::{self, COMMON, Captured, Import, Projection, Unit, UnitSpec},
@@ -30,18 +30,18 @@ const COMPAT: &str = "../stela-linux/src/compat";
 #[cfg(feature = "linux-kernel")]
 pub struct Linux {
     pub environment: stela_c_build::linux::Environment,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "drm-port")]
     pub archive: PathBuf,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "drm-port")]
     pub common_archive: PathBuf,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "drm-port")]
     pub captured: Vec<Captured>,
     pub hosted: Vec<PathBuf>,
 }
 /// DRM's core and the helpers nouveau selects, as Linux's `drm-y`,
 /// `drm_kms_helper-y`, `ttm-y`, `gpu-sched-y` and `drm_display_helper-y`
 /// compose them under Stela's Kconfig.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "drm-port")]
 const DRM_SOURCES: &[&str] = &[
     "drm_atomic",
     "drm_atomic_uapi",
@@ -87,6 +87,11 @@ const DRM_SOURCES: &[&str] = &[
     "drm_atomic_helper",
     "drm_atomic_state_helper",
     "drm_bridge_helper",
+    // CONFIG_DRM_CLIENT: what drm_dev_unregister() tears its clients down
+    // through, and the modeset client drm_client_dev_register() creates.
+    "drm_client",
+    "drm_client_event",
+    "drm_client_modeset",
     "drm_crtc_helper",
     "drm_damage_helper",
     "drm_flip_work",
@@ -124,8 +129,36 @@ const DRM_SOURCES: &[&str] = &[
     "display/drm_scdc_helper",
 ];
 
+/// What xe's Kconfig entry selects beyond the list above, named below the
+/// Linux tree's root.
+#[cfg(feature = "xe-port")]
+const XE_SOURCES: &[&str] = &[
+    "drivers/gpu/drm/drm_buddy",
+    // Kbuild's `drm_suballoc_helper.o`, compiled from `drm_suballoc.c`.
+    "drivers/gpu/drm/drm_suballoc",
+    // The library half of the environment xe's Kconfig pulls in: a search, the
+    // bitmap allocators, the string sizing helpers and the page pools. Only a
+    // port that needs them compiles them, so a machine with one driver carries
+    // one driver's services.
+    "lib/bsearch",
+    "lib/bitmap-alloc",
+    "lib/string_helpers",
+    "mm/mempool",
+    // The command line xe's string helpers read, and the buddy allocator its
+    // local-memory manager carves the card's memory up with.
+    "lib/cmdline",
+    "drivers/gpu/buddy",
+    // REGMAP, which xe selects while the I2C core it uses for the AMC is
+    // built in. Its register cache flavours are part of the same option.
+    "drivers/base/regmap/regmap",
+    "drivers/base/regmap/regcache",
+    "drivers/base/regmap/regcache-rbtree",
+    "drivers/base/regmap/regcache-flat",
+    "drivers/base/regmap/regcache-maple",
+];
+
 /// Class-owned registration prefix after the shared common cohort.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "drm-port")]
 const DRM_UNITS: &[UnitSpec] = &[
     UnitSpec {
         scope: stela_c_build::linux_capture::Scope {
@@ -166,7 +199,7 @@ const DRM_UNITS: &[UnitSpec] = &[
 ];
 
 /// Reviewed common-first/DRM-next prefix, used again by the final class image.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "drm-port")]
 pub fn environment_units() -> Vec<UnitSpec> {
     COMMON.iter().chain(DRM_UNITS).copied().collect()
 }
@@ -193,18 +226,31 @@ impl Linux {
         .into_iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "drm-port")]
         let mut upstream = upstream;
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "drm-port")]
         upstream.extend(
             DRM_SOURCES
                 .iter()
                 .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
         );
+        #[cfg(feature = "xe-port")]
+        upstream.extend(
+            XE_SOURCES
+                .iter()
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
+        );
         let hosted_upstream = upstream[..4].to_vec();
         let mut build = stela_c_build::native::configure();
         environment.apply(&mut build, None, &[], None);
-        #[cfg(feature = "nouveau-port")]
+        // regmap's own directory, as Kbuild's `CFLAGS_regmap.o := -I$(src)`
+        // gives it: its trace header re-includes itself by path. A quoted
+        // include only, so it cannot shadow another header.
+        #[cfg(feature = "xe-port")]
+        build
+            .flag("-iquote")
+            .flag(format!("{LINUX}/drivers/base/regmap"));
+        #[cfg(feature = "drm-port")]
         let (captured, shared_count) = {
             let mut captured_build = upstream_build(&build, Path::new(COMPAT));
             upstream_warnings(&mut captured_build);
@@ -279,7 +325,7 @@ impl Linux {
             }
             (captured, shared_count)
         };
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "drm-port")]
         {
             let source = linux_capture::source(
                 &captured,
@@ -303,11 +349,11 @@ impl Linux {
         );
         let mut linux = Self {
             environment,
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "drm-port")]
             archive: _class_archive,
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "drm-port")]
             common_archive: shared.join("libstela-linux.a"),
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "drm-port")]
             captured,
             hosted: Vec::new(),
         };
@@ -335,9 +381,13 @@ impl Linux {
         linux
     }
 
-    #[cfg(feature = "nouveau-port")]
-    pub fn take_captured(&mut self) -> Vec<Captured> {
-        std::mem::take(&mut self.captured)
+    /// The environment's captured units, which the port projects into its own
+    /// class image. Every selected port projects the same cohort, and no image
+    /// carries two, so this hands out a copy: a build with both ports selected
+    /// (the gate's `--all-features`) needs the cohort twice.
+    #[cfg(feature = "drm-port")]
+    pub fn cohort(&self) -> Vec<Captured> {
+        self.captured.clone()
     }
 
     pub fn tests(&self, tests: &mut stela_c_build::linux_build::Tests) {

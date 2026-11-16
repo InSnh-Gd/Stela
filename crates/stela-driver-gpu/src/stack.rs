@@ -37,7 +37,7 @@ pub struct GpuStack {
     /// The Vulkan driver linked into the image. This crate's own test
     /// binary links no driver archive, so it holds none.
     #[cfg(all(feature = "metal-linked", not(test)))]
-    pub vulkan: crate::metal::native::Driver,
+    pub vulkan: Option<crate::metal::native::Driver>,
 }
 
 impl Kernel {
@@ -47,7 +47,12 @@ impl Kernel {
     }
 }
 
-/// Every stack this build holds.
+/// Every stack this build holds. NVIDIA's stands for every image, as the
+/// engine's own refusal lines do; Intel's joins it with the xe port, since
+/// no other build can bind one.
+#[cfg(feature = "xe-port")]
+pub static STACKS: [&GpuStack; 2] = [&NVIDIA, &INTEL];
+#[cfg(not(feature = "xe-port"))]
 pub static STACKS: [&GpuStack; 1] = [&NVIDIA];
 
 /// nouveau with GSP firmware, NVK and NAK.
@@ -64,7 +69,32 @@ pub static NVIDIA: GpuStack = GpuStack {
     #[cfg(feature = "metal")]
     metal: crate::metal::nvidia::ADMISSION,
     #[cfg(all(feature = "metal-linked", not(test)))]
-    vulkan: crate::metal::nvidia::DRIVER,
+    vulkan: Some(crate::metal::nvidia::DRIVER),
+};
+
+/// Intel's integrated GPUs: the xe kernel driver over its GuC and HuC
+/// firmware, for the Xe3P parts Stela drives (`build/xe.rs`).
+///
+/// The Metal device this stack gives macOS is the xe port's own Vulkan
+/// driver, which the image does not carry yet: [`crate::metal::intel`]
+/// admits nothing, so a boot that claimed an Intel GPU stops with the reason
+/// rather than starting a guest whose WindowServer has no device.
+#[cfg(feature = "xe-port")]
+pub static INTEL: GpuStack = GpuStack {
+    vendor: Vendor::Intel,
+    kernel: Kernel {
+        driver: "xe",
+        // Panther Lake's `ptl_desc.dma_mask_size`, which xe sets on the
+        // function (`drivers/gpu/drm/xe/xe_pci.c`): a mapping past it is
+        // refused, not truncated.
+        dma_bits: 46,
+        chip: crate::intel_chip::query::device_id,
+        memory_bytes: crate::intel_chip::query::memory_bytes,
+    },
+    #[cfg(feature = "metal")]
+    metal: crate::metal::intel::ADMISSION,
+    #[cfg(all(feature = "metal-linked", not(test)))]
+    vulkan: None,
 };
 
 /// Brings Linux up and registers every kernel driver built into the image,
@@ -75,10 +105,19 @@ pub static NVIDIA: GpuStack = GpuStack {
 /// # Safety
 /// On the canonical Linux owner's original managed task after Initial and
 /// SRCU startup have completed, once per environment. Initcalls may sleep.
-#[cfg(feature = "nouveau-port")]
+#[cfg(any(feature = "nouveau-port", feature = "xe-port"))]
 pub unsafe fn start_kernel() -> Result<(), stela_linux::owner::Errno> {
-    // SAFETY: the caller's contract.
-    unsafe { crate::nouveau::start() }
+    // SAFETY: the caller's contract, once per image.
+    #[cfg(feature = "nouveau-port")]
+    unsafe {
+        crate::nouveau::start()?
+    };
+    #[cfg(feature = "xe-port")]
+    // SAFETY: as above.
+    unsafe {
+        crate::xe::start()?
+    };
+    Ok(())
 }
 
 impl GpuStack {
@@ -116,7 +155,18 @@ mod tests {
         let nvidia = GpuStack::select(&adapter(0x10de)).unwrap();
         assert!(core::ptr::eq(nvidia, &NVIDIA));
         assert_eq!(nvidia.kernel.driver, "nouveau");
-        for vendor in [0x1002, 0x8086, 0x1234] {
+        // Intel's GPU is answered by the xe port's stack, which only an image
+        // carrying that port holds; the rest have no stack in any build.
+        let intel = GpuStack::select(&adapter(0x8086));
+        if cfg!(feature = "xe-port") {
+            assert_eq!(intel.unwrap().kernel.driver, "xe");
+        } else {
+            assert_eq!(
+                intel.err(),
+                Some(adapter(0x8086).unavailable_reason())
+            );
+        }
+        for vendor in [0x1002, 0x1234] {
             let adapter = adapter(vendor);
             assert_eq!(
                 GpuStack::select(&adapter).err(),
@@ -161,5 +211,50 @@ mod tests {
         assert_eq!((NVIDIA.kernel.memory_bytes)(&mut refuse), None);
         let mut empty = |_: u32, _: *mut c_void| 0;
         assert_eq!((NVIDIA.kernel.memory_bytes)(&mut empty), None);
+    }
+
+    /// xe answers its own device query: `DRM_XE_DEVICE_QUERY_CONFIG` for the
+    /// device ID in the first `info` word's lower 16 bits
+    /// (`DRM_XE_QUERY_CONFIG_REV_AND_DEVICE_ID`), and
+    /// `DRM_XE_DEVICE_QUERY_MEM_REGIONS` for what its VRAM regions total.
+    #[cfg(feature = "xe-port")]
+    #[test]
+    fn xe_queries_ask_its_device_query_and_keep_refusals() {
+        let mut asked = alloc::vec::Vec::new();
+        let mut answer = |request: u32, argument: *mut c_void| {
+            // SAFETY: both queries pass their own `struct drm_xe_device_query`,
+            // whose `data` points at the buffer its caller allocated.
+            let record = unsafe { &mut *argument.cast::<[u64; 4]>() };
+            // The query is the record's first 32-bit field, its size the
+            // second.
+            let query = record[1] as u32;
+            let bytes = (record[1] >> 32) as usize;
+            asked.push((request, query));
+            // SAFETY: the caller allocated `bytes` for this reply.
+            let reply = unsafe { core::slice::from_raw_parts_mut(record[2] as *mut u8, bytes) };
+            match query {
+                // `DRM_XE_DEVICE_QUERY_CONFIG`: one parameter, the device ID
+                // and revision.
+                2 => {
+                    reply[..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+                    reply[8..16].copy_from_slice(&0x0000_0000_0000_b080u64.to_le_bytes());
+                }
+                // `DRM_XE_DEVICE_QUERY_MEM_REGIONS`: one VRAM region of
+                // 3072 MiB, whose `total_size` lies past its two halves.
+                1 => {
+                    reply[..4].copy_from_slice(&1u32.to_le_bytes());
+                    reply[8..10].copy_from_slice(&1u16.to_le_bytes());
+                    reply[16..24].copy_from_slice(&(3072u64 << 20).to_le_bytes());
+                }
+                other => panic!("unexpected query {other}"),
+            }
+            0
+        };
+        assert_eq!((INTEL.kernel.chip)(&mut answer), Some(0xb080));
+        assert_eq!((INTEL.kernel.memory_bytes)(&mut answer), Some(3072 << 20));
+        assert_eq!(asked, [(0xc020_6440, 2), (0xc020_6440, 1)]);
+        let mut refuse = |_: u32, _: *mut c_void| -22;
+        assert_eq!((INTEL.kernel.chip)(&mut refuse), None);
+        assert_eq!((INTEL.kernel.memory_bytes)(&mut refuse), None);
     }
 }

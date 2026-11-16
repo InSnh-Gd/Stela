@@ -1,6 +1,3 @@
-# nouveau, shared DRM helpers, ACPICA and kernel headers; not a
-# buildable kernel tree. netfilter's headers differ only in case, which a
-# case-insensitive file system cannot check out.
 /drivers/acpi/acpica/
 /drivers/base/map.c
 /drivers/base/property.c
@@ -356,3 +353,23 @@
 /security/Makefile
 /security/commoncap.c
 /security/commoncap_ptrace.c
+/drivers/gpu/drm/xe/
+/drivers/gpu/drm/i915/display/
+
+# xe selects regmap for its I2C-attached AMC when the I2C core is built in.
+/drivers/base/regmap/
+
+# Upstream files xe needs that the nouveau port's selection did not reach.
+/lib/bsearch.c
+/mm/mempool.c
+
+# The device model's managed resources, which the DRM drivers allocate through.
+/drivers/base/devres.c
+/drivers/base/base.h
+/drivers/base/trace.h
+
+# xe's VRAM allocator, the command line xe's string helpers parse, and the
+# resizable-BAR support its PCI code calls.
+/drivers/gpu/buddy.c
+/lib/cmdline.c
+/drivers/pci/rebar.c

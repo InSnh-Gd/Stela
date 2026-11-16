@@ -49,6 +49,13 @@ int down_read_killable(struct rw_semaphore *sem)
 	return wait_var_event_killable(&sem->count, down_read_trylock(sem)) ? -EINTR : 0;
 }
 
+int down_read_interruptible(struct rw_semaphore *sem)
+{
+	/* Stela's wait reports that a signal arrived without classifying it, so
+	 * the interruptible and killable forms answer alike. */
+	return down_read_killable(sem);
+}
+
 void down_write(struct rw_semaphore *sem)
 {
 	wait_var_event(&sem->count, down_write_trylock(sem));
