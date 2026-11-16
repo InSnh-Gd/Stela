@@ -111,6 +111,27 @@ long simple_strtol(const char *cp, char **endp, unsigned int base)
 	return negative ? -(long)value : (long)value;
 }
 
+/* The same digits, read as an unsigned long long. */
+unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base)
+{
+	unsigned long long value = 0;
+
+	if (!base)
+		base = hex_prefix(cp) ? 16 : *cp == '0' ? 8 : 10;
+	if (base == 16 && hex_prefix(cp))
+		cp += 2;
+	for (; digit(*cp) < base; cp++)
+		value = value * base + digit(*cp);
+	if (endp)
+		*endp = (char *)cp;
+	return value;
+}
+
+unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base)
+{
+	return (unsigned long)simple_strtoull(cp, endp, base);
+}
+
 int kstrtou16(const char *s, unsigned int base, u16 *res)
 {
 	unsigned long long value;

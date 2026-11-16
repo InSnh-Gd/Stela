@@ -53,7 +53,16 @@ bool parameq(const char *a, const char *b)
  * Parse a string to get a param value pair.
  * You can use " around spaces, but can't escape ".
  * Hyphens and underscores equivalent in parameter names.
+ *
+ * The text keeps the upstream name; the link does not. lib/cmdline.c defines
+ * the exported `next_arg` this file's helper duplicates, and a port whose
+ * helpers ask that file for its siblings (xe's string sizing asks for
+ * `get_options`) compiles both. `<linux/string.h>` declares the exported one,
+ * and a `static` definition cannot follow that declaration: C keeps the
+ * linkage the first declaration gave it, which clang accepts in silence. The
+ * name is redirected instead, as deferred_core.c does for its original.
  */
+#define next_arg stela_original_next_arg
 char *next_arg(char *args, char **param, char **val)
 {
 	unsigned int i, equals = 0;
@@ -240,6 +249,7 @@ static struct stela_linux_params_result parse_parameter_args(
 	}
 	return result;
 }
+#undef next_arg
 
 char *parse_args(const char *doing, char *args, const struct kernel_param *params,
 		 unsigned int num, s16 min_level, s16 max_level, void *arg,

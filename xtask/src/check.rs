@@ -2,8 +2,8 @@
 //!
 //! Formatting reads only sources, so it runs beside everything else. Once
 //! the GPU sources are fetched, two lanes run at once, each in its own
-//! target directory: the UEFI target's Clippy in [`BOOT_TARGET_DIR`], then
-//! the other shipped hosts' ([`CROSS`]) and a compile for
+//! target directory: the UEFI target's Clippy and a link of each GPU port in
+//! [`BOOT_TARGET_DIR`], then the other shipped hosts' ([`CROSS`]) and a compile for
 //! [`RELEASE_HOST`] in [`CROSS_TARGET_DIR`], and the host's Clippy and test
 //! build in `target`. The tests then run alone.
 //! A lane stops at its first failure; the gate fails if any part did, once
@@ -87,6 +87,10 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
         uefi(["-p", "stela-boot-core", "--features", "native-acpi"]),
         uefi(BOOT),
         uefi([BOOT[0], BOOT[1], "--features", "diagnostics"]),
+        // The xe port: Linux's Intel driver over the same environment, one
+        // port at a time, so its own build of the boot package is checked
+        // beside the NVK image's.
+        uefi([BOOT[0], BOOT[1], "--features", "xe"]),
         uefi(["-p", "stela-driver-base", "--features", "native-acpi"]),
         uefi(["-p", "stela-driver-net", "--features", "native-acpi"]),
         uefi(["-p", "stela-driver-storage"]),
@@ -98,6 +102,12 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
             "--features",
             "metal-linked,nouveau-port",
         ]),
+        uefi([
+            "-p",
+            "stela-driver-gpu",
+            "--features",
+            "metal-linked,xe-port",
+        ]),
     ];
     let mut nvk_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk"]);
     // Mesa's unchanged path crates declare their upstream naming lint
@@ -105,20 +115,25 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
     // Stela's driver owners are checked separately above.
     nvk_clippy.env("RUSTFLAGS", BOOT_RUSTFLAGS);
     boot_lane.push(nvk_clippy);
-    let mut linked = command([
-        "build",
-        "--locked",
-        "--manifest-path",
-        BOOT_MANIFEST,
-        "--features",
-        "nvk",
-        "--target",
-        BOOT_TARGET,
-        "--target-dir",
-        BOOT_TARGET_DIR,
-    ]);
-    linked.env("CARGO_BUILD_JOBS", gpu_jobs.to_string());
-    boot_lane.push(linked);
+    // Each port links its own class image. A Clippy build compiles no C, so
+    // only a link proves the port's own C resolves against the environment's
+    // archive and the interfaces it imports from Linux.
+    for feature in ["nvk", "xe"] {
+        let mut linked = command([
+            "build",
+            "--locked",
+            "--manifest-path",
+            BOOT_MANIFEST,
+            "--features",
+            feature,
+            "--target",
+            BOOT_TARGET,
+            "--target-dir",
+            BOOT_TARGET_DIR,
+        ]);
+        linked.env("CARGO_BUILD_JOBS", gpu_jobs.to_string());
+        boot_lane.push(linked);
+    }
     boot_lane.extend(CROSS.map(|(target, packages)| {
         let mut clippy = command(["clippy", "--locked"]);
         clippy

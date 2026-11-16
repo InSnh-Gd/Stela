@@ -218,7 +218,7 @@ impl Platform for Host {
     unsafe fn unmap_device(&self, _: *mut c_void) {
         process::abort()
     }
-    fn map_pages(&self, _: &[u64]) -> Option<*mut c_void> {
+    fn map_pages(&self, _: &[u64], _: u64) -> Option<*mut c_void> {
         None
     }
     unsafe fn unmap_pages(&self, _: *mut c_void, _: usize) {

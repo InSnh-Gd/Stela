@@ -114,13 +114,18 @@ enum Scenario {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Build `stela.efi` with its NVK GPU stack and guest components.
+    /// Build `stela.efi` with one GPU port: the NVK stack and its guest
+    /// components, or the xe port.
     Build {
         #[arg(long)]
         release: bool,
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
+        /// Which GPU port the image carries. `nvk` builds Mesa and the guest
+        /// components first; `xe` needs nothing beyond the pinned sources.
+        #[arg(long, value_enum, default_value_t = Port::Nvk)]
+        port: Port,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -487,28 +492,66 @@ fn storage_disks(paths: &[PathBuf], serials: &[String]) -> Result<Vec<(PathBuf, 
     Ok(paths.iter().cloned().zip(serials).collect())
 }
 
+/// The GPU port an image carries, which its `--features` names. One at a
+/// time: each projects the environment's registration units into the one
+/// image its own class archive is linked from.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum Port {
+    /// No port: the image carries no GPU driver, and needs nothing built
+    /// before it, which is what `xtask run` boots.
+    None,
+    /// NVK, NIR and NAK over nouveau, from `cargo xtask gpu nvk`'s output.
+    #[default]
+    Nvk,
+    /// Linux's xe driver for this PC's own Intel Xe3P GPU.
+    Xe,
+}
+
+impl Port {
+    /// The cargo feature the boot package selects for this port, or `None`
+    /// for an image that carries no port.
+    fn feature(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Nvk => Some("nvk"),
+            Self::Xe => Some("xe"),
+        }
+    }
+}
+
 pub fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Build {
             release,
             diagnostics,
+            port,
         } => {
-            crate::gpu::fetch::fetch(false)?;
-            crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            println!("{}", build_for_boot(release, diagnostics, true)?.display());
+            prepare(port)?;
+            println!("{}", build_for_boot(release, diagnostics, port)?.display());
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(arguments) => launch(*arguments),
     }
 }
 
-pub fn build(release: bool) -> Result<PathBuf> {
-    crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, true)
+/// Everything an image of this port needs built before it: the NVK stack and
+/// the guest components, or nothing for xe, whose driver comes from the
+/// pinned sources alone.
+pub fn prepare(port: Port) -> Result<()> {
+    crate::gpu::fetch::fetch(false)?;
+    if port.feature() == Some("nvk") {
+        crate::gpu::build_nvk(crate::gpu::default_jobs())?;
+    }
+    Ok(())
 }
 
-fn build_for_boot(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
-    let built = build_with_diagnostics(release, diagnostics, nvk)?;
+pub fn build(release: bool, port: Port) -> Result<PathBuf> {
+    prepare(port)?;
+    build_with_diagnostics(release, false, port)
+}
+
+fn build_for_boot(release: bool, diagnostics: bool, port: Port) -> Result<PathBuf> {
+    let built = build_with_diagnostics(release, diagnostics, port)?;
     if !release {
         return Ok(built);
     }
@@ -536,15 +579,15 @@ pub(crate) fn deploy_image(built: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_with_diagnostics(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
+fn build_with_diagnostics(release: bool, diagnostics: bool, port: Port) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
     command.args(["--target", BOOT_TARGET, "--target-dir", BOOT_TARGET_DIR]);
     if diagnostics {
         command.args(["--features", "diagnostics"]);
     }
-    if nvk {
-        command.args(["--features", "nvk"]);
+    if let Some(feature) = port.feature() {
+        command.args(["--features", feature]);
     }
     if release {
         command.arg("--release");
@@ -713,7 +756,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
     let attached = storage_disks(&arguments.storage_disk, &arguments.storage_serial)?;
     let image = match &arguments.image {
         Some(image) => image.clone(),
-        None => build_for_boot(true, true, false)?,
+        None => build_for_boot(true, true, Port::None)?,
     };
     let paths = storage::Paths::new(arguments.output.clone());
     if paths.output.exists() {

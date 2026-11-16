@@ -15,6 +15,7 @@ use stela_driver_base::{
 };
 
 const NVIDIA: u16 = 0x10de;
+const INTEL: u16 = 0x8086;
 const DISPLAY: u8 = 3;
 const EXPRESS: u8 = 0x10;
 
@@ -185,7 +186,7 @@ fn preflight<C: ConfigSpace>(
     bus_reset: bool,
 ) -> Result<Option<Reset>, Error> {
     timer.check().map_err(Error::Clock)?;
-    if function.vendor != NVIDIA || function.class[0] != DISPLAY {
+    if !prepared_vendor(function.vendor) || function.class[0] != DISPLAY {
         return Err(Error::Identity);
     }
     requester::validate_stopped(function).map_err(Error::Claim)?;
@@ -208,6 +209,14 @@ fn preflight<C: ConfigSpace>(
         None if bus_reset => Ok(Some(Reset::SecondaryBus)),
         None => Err(Error::ResetUnavailable),
     }
+}
+
+/// The display controllers this cold preparation is written for: NVIDIA's
+/// GPUs, and Intel's integrated ones when the image carries the xe port.
+/// Nothing else may take the reset, root drain and private-domain binding a
+/// caller reaches through a successful preparation.
+fn prepared_vendor(vendor: u16) -> bool {
+    vendor == NVIDIA || (cfg!(feature = "xe-port") && vendor == INTEL)
 }
 
 /// Read-only early qualification before native BAR probing/mapping. Success

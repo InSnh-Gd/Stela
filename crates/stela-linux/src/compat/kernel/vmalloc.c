@@ -46,8 +46,9 @@ static struct area *area_of(const void *address)
 	return node ? rb_entry(node, struct area, node) : NULL;
 }
 
-/* Maps area's pages and records the mapping, or leaves nothing mapped. */
-static void *map_area(struct area *area)
+/* Maps area's pages, cached as protection asks, and records the mapping, or
+ * leaves nothing mapped. */
+static void *map_area(struct area *area, u64 protection)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	if (stela_linux_kernel_hosted() || !owner->services->map_pages) {
@@ -59,7 +60,8 @@ static void *map_area(struct area *area)
 		return NULL;
 	for (unsigned int i = 0; i < area->count; i++)
 		physical[i] = page_to_phys(area->pages[i]);
-	void *address = owner->services->map_pages(owner->context, physical, area->count);
+	void *address = owner->services->map_pages(owner->context, physical, area->count,
+						   protection);
 	kfree(physical);
 	if (address) {
 		area->address = address;
@@ -104,7 +106,7 @@ void *__vmalloc_noprof(unsigned long size, gfp_t gfp_mask)
 			return NULL;
 		}
 	}
-	void *address = map_area(area);
+	void *address = map_area(area, pgprot_val(PAGE_KERNEL));
 	if (!address) {
 		free_pages_of(area, area->count);
 		kfree(area);
@@ -122,10 +124,23 @@ void *vzalloc_noprof(unsigned long size)
 	return __vmalloc_noprof(size, GFP_KERNEL | __GFP_ZERO);
 }
 
+/* Whether protection is a kernel mapping vmap's callers make: write-back,
+ * write-combining or uncached, which are the cache attributes the owner maps
+ * pages in. Linux reaches vmap with a vmalloc/ioremap protection, and
+ * anything else (PAGE_NONE, a user or executable request) is not one. */
+static bool kernel_protection(pgprot_t protection)
+{
+	u64 request = pgprot_val(protection);
+
+	return request == pgprot_val(PAGE_KERNEL) ||
+	       request == pgprot_val(pgprot_writecombine(PAGE_KERNEL)) ||
+	       request == pgprot_val(pgprot_noncached(PAGE_KERNEL));
+}
+
 void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot)
 {
 	(void)flags;
-	if (pgprot_val(prot) != pgprot_val(PAGE_KERNEL)) {
+	if (!kernel_protection(prot)) {
 		stela_linux_unsupported("vmap with another protection");
 		return NULL;
 	}
@@ -133,7 +148,7 @@ void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_
 	if (!area)
 		return NULL;
 	memcpy(area->pages, pages, count * sizeof(*pages));
-	void *address = map_area(area);
+	void *address = map_area(area, pgprot_val(prot));
 	if (!address)
 		kfree(area);
 	return address;
@@ -305,14 +320,16 @@ static const struct stela_linux_page_ops ops = {
 
 static u8 alias[2 * PAGE_SIZE];
 static bool aliasing;
+static u64 protection;
 
 /* The pages are contiguous here, so the window already maps them; a second
  * mapping of them lies elsewhere, as the owner's would. */
-static void *map_pages(void *context, const u64 *physical, size_t count)
+static void *map_pages(void *context, const u64 *physical, size_t count, u64 prot)
 {
 	(void)context;
 	for (size_t i = 1; i < count; i++)
 		assert(physical[i] == physical[0] + i * PAGE_SIZE);
+	protection = prot;
 	return aliasing ? alias : memory + (physical[0] - PHYSICAL);
 }
 
@@ -357,8 +374,22 @@ int main(void)
 	u8 *again = vmap(pages, 2, VM_MAP, PAGE_KERNEL);
 	aliasing = false;
 	assert(again == alias && vmalloc_to_page(again + PAGE_SIZE) == second);
+	assert(protection == pgprot_val(PAGE_KERNEL));
 	vunmap(again);
 	assert(unmapped == 2 && is_vmalloc_addr(zeroed));
+	/* A protection's cache attribute reaches the owner; one that is no
+	 * kernel mapping does not. */
+	aliasing = true;
+	assert(vmap(pages, 1, VM_MAP, pgprot_writecombine(PAGE_KERNEL)) == alias);
+	aliasing = false;
+	assert(protection == pgprot_val(pgprot_writecombine(PAGE_KERNEL)));
+	vunmap(alias);
+	aliasing = true;
+	assert(vmap(pages, 1, VM_MAP, pgprot_noncached(PAGE_KERNEL)) == alias);
+	aliasing = false;
+	assert(protection == pgprot_val(pgprot_noncached(PAGE_KERNEL)));
+	vunmap(alias);
+	assert(unmapped == 4);
 	assert(!vmap(pages, 2, VM_MAP, PAGE_NONE));
 
 	/* A request the pages cannot cover undoes what it allocated. */
@@ -376,7 +407,7 @@ int main(void)
 	kvfree(large);
 	vfree(NULL);
 	vfree(zeroed);
-	assert(unmapped == 5);
+	assert(unmapped == 7);
 
 	/* A slab object keeps its bytes when it grows. */
 	u8 *grown = kvmalloc(16, GFP_KERNEL);

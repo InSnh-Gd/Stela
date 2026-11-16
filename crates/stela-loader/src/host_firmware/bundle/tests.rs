@@ -21,8 +21,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 2, recipes().count());
-    // The recipes' recorded lengths: 86 files, 115.8 MiB.
-    assert_eq!((count, bytes), (86, 121_467_160), "{count} {bytes}");
+    // The recipes' recorded lengths: 88 files, 116.8 MiB.
+    assert_eq!((count, bytes), (88, 122_483_800), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -157,6 +157,27 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);
     assert_eq!(members(&old), USB);
+    // A Panther Lake GPU reads the xe port's own pair, and about a megabyte
+    // of them beside the GSP-RM image an NVIDIA PC reads.
+    let ptl = select(&[pci(0x8086, 0xb080, 0x03)]);
+    let mut expected: Vec<&str> = USB.to_vec();
+    expected.extend(["xe/ptl_guc_70.bin", "xe/ptl_huc.bin"]);
+    expected.sort_unstable();
+    assert_eq!(members(&ptl), expected);
+    assert!(ptl.unknown.is_empty());
+    assert_eq!(
+        ptl.wanted
+            .iter()
+            .find(|(artifact, _)| artifact.member == "xe/ptl_guc_70.bin")
+            .unwrap()
+            .1,
+        "pci 8086:b080"
+    );
+    assert!(ptl.bytes() < 4_000_000, "{}", ptl.bytes());
+    // An older Intel display chip xe's own table does not name is named once.
+    let tiger = select(&[pci(0x8086, 0x9a49, 0x03)]);
+    assert_eq!(tiger.unknown, ["pci 8086:9a49"]);
+    assert_eq!(members(&tiger), USB);
 }
 
 #[test]

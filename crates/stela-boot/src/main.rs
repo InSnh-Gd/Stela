@@ -12,6 +12,12 @@
 //! choices (`choice`) pick the option line first.
 #![no_std]
 #![no_main]
+// One GPU port at a time: each projects the environment's registration units
+// into the one image its own class archive is linked from. The driver crate
+// compiles every port selected, so its `--all-features` build still builds
+// both class archives; the image refuses the pair.
+#[cfg(all(feature = "nvk", feature = "xe"))]
+compile_error!("`nvk` (nouveau) and `xe` are one port at a time");
 extern crate alloc;
 pub use stela_contracts::Refusal;
 pub type Result<T, E = Refusal> = core::result::Result<T, E>;

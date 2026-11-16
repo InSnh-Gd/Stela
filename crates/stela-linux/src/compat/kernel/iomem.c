@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Linux's copies to and from I/O memory, a byte at a time: every mapping
  * accepts those, whatever its alignment. */
+#include <linux/device.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <stela/linux.h>
@@ -74,4 +75,28 @@ void iounmap(volatile void __iomem *addr)
 	if (addr)
 		owner->services->unmap_device(owner->context,
 					      (void *)((unsigned long)addr & PAGE_MASK));
+}
+
+static void undev_map(struct device *dev, void *resource)
+{
+	(void)dev;
+	iounmap(*(void __iomem **)resource);
+}
+
+/* A window a driver maps for as long as its device exists, following
+ * lib/devres.c. */
+void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset,
+			      resource_size_t size)
+{
+	void __iomem **resource = devres_alloc(undev_map, sizeof(*resource), GFP_KERNEL);
+
+	if (resource) {
+		*resource = ioremap_wc(offset, size);
+		if (*resource) {
+			devres_add(dev, resource);
+			return *resource;
+		}
+		devres_free(resource);
+	}
+	return NULL;
 }

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: InSnh-Gd <2479955131@qq.com>
+Date: Mon, 16 Nov 2026 13:56:23 +0000
+Subject: [PATCH] fix(pm): answer runtime PM with the awake device this
+ environment has, so no interrupt's work is dropped
+
+---
+ include/linux/pm_runtime.h | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/include/linux/pm_runtime.h b/include/linux/pm_runtime.h
+index 64921b10ac74f4c886414a28ce396b26a186bd47..c984386b51b582c09245fbb194d28e8d8424a6fa 100644
+--- a/include/linux/pm_runtime.h
++++ b/include/linux/pm_runtime.h
+@@ -274,13 +274,32 @@ static inline int pm_schedule_suspend(struct device *dev, unsigned int delay)
+ {
+ 	return -ENOSYS;
+ }
++/*
++ * Stela powers a device when it claims it and keeps it powered for as long as
++ * its owner runs, so every device is awake: there is no usage count that
++ * could be zero and no state machine that could suspend it. A driver asks
++ * these two questions from the paths an interrupt and a work item take - xe's
++ * G2H receive and its CT fast path are two - and Linux's !CONFIG_PM answers,
++ * -EINVAL and 0, read as "not awake" and drop the work the interrupt asked
++ * for. The truthful answer here is the one a PM-enabled kernel gives for a
++ * device that never suspends. Nothing counts the reference either way, since
++ * every put in this configuration is the !CONFIG_PM stub below.
++ */
+ static inline int pm_runtime_get_if_in_use(struct device *dev)
+ {
++#ifdef CONFIG_STELA
++	return 1;
++#else
+ 	return -EINVAL;
++#endif
+ }
+ static inline int pm_runtime_get_if_active(struct device *dev)
+ {
++#ifdef CONFIG_STELA
++	return 1;
++#else
+ 	return -EINVAL;
++#endif
+ }
+ static inline int __pm_runtime_set_status(struct device *dev,
+ 					    unsigned int status) { return 0; }

@@ -190,6 +190,7 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/fs/stashed_path.c")),
             PathBuf::from(format!("{LINUX}/fs/mount_cache.c")),
             PathBuf::from(format!("{LINUX}/fs/mnt_idmapping.c")),
+            PathBuf::from(format!("{LINUX}/drivers/base/devres.c")),
             PathBuf::from(format!("{LINUX}/drivers/base/map.c")),
             PathBuf::from(format!("{LINUX}/drivers/base/property.c")),
             PathBuf::from(format!("{LINUX}/fs/char_dev.c")),

@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <limits.h>
 #include <locale.h>
 #include <math.h>
@@ -1167,6 +1168,16 @@ int dladdr(const void *address, Dl_info *info)
 {
 	(void)address;
 	(void)info;
+	return 0;
+}
+
+/* The image is linked whole, so no object is loaded and the walk has nothing
+ * to report: its callback is never called, as a process with no dynamic
+ * linker sees. */
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data), void *data)
+{
+	(void)callback;
+	(void)data;
 	return 0;
 }
 

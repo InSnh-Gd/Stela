@@ -4,6 +4,14 @@
  * uniprocessor, non-preemptible configuration of Stela's own arch. Options
  * not listed are disabled, so debug, tracing, KUnit and fault-injection
  * hooks compile out exactly as in a kernel built without them. */
+/* `CONFIG_PM` is one of the options not listed: there is no runtime PM core
+ * here, and a device Stela claims is powered for as long as its owner runs.
+ * A driver written for a PM-enabled kernel still asks
+ * `pm_runtime_get_if_active()` and `pm_runtime_get_if_in_use()` whether its
+ * device is awake, and the `!CONFIG_PM` stand-ins answer "asleep", which makes
+ * it drop work an interrupt asked for; those two answer "awake" for
+ * `CONFIG_STELA` in `include/linux/pm_runtime.h`. The rest of the stand-ins
+ * are already this environment's truth. */
 #define CONFIG_64BIT 1
 /* Select native architecture ownership hooks in the shared Linux sources. */
 #define CONFIG_STELA 1
@@ -69,6 +77,22 @@
 #define CONFIG_DRM_DISPLAY_HDMI_HELPER 1
 #define CONFIG_DMA_SHARED_BUFFER 1
 #define CONFIG_SYNC_FILE 1
+
+/* xe and what its Kconfig entry selects. Its display half is built only for
+ * the module configuration, so a built-in xe compiles it out, as it does the
+ * ACPI, SVM, SR-IOV and debug options Stela does not configure. */
+#define CONFIG_DRM_XE 1
+#define CONFIG_DRM_BUDDY 1
+#define CONFIG_DRM_SUBALLOC_HELPER 1
+/* DRM_CLIENT_SELECTION's code level half; its default clients are not built. */
+#define CONFIG_DRM_CLIENT 1
+#define CONFIG_INTERVAL_TREE 1
+/* xe selects the MMU notifier interface for its SVM half; its inline
+ * interval helpers are what the VM paths reference even when SVM is not
+ * configured. */
+#define CONFIG_MMU_NOTIFIER 1
+/* xe selects REGMAP for the AMC on its I2C bus while the I2C core is in. */
+#define CONFIG_REGMAP 1
 
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_XE_FORCE_PROBE ""

@@ -60,6 +60,7 @@ use stela_drivers::{
         pci::{
             Bar, ConfigError, ConfigFailure, ConfigSpace, Function,
             owned::{ConfigRetention, OwnedConfig},
+            regs,
         },
     },
     firmware::{Catalog, ErrorKind as FirmwareError, Provider},
@@ -114,6 +115,10 @@ const RESOURCE_WIDE: u64 = 0x10_0000;
 /// `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask. A mapping
 /// past it is refused (`function::Mappings`), not truncated.
 const DMA_LIMIT: u64 = (1 << 47) - 1;
+/// The DMA mask xe's own PCI table gives the Panther Lake GPUs
+/// (`ptl_desc.dma_mask_size = 46`), which is what xe sets on the function.
+#[cfg(feature = "xe")]
+const INTEL_DMA_LIMIT: u64 = (1 << 46) - 1;
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
@@ -534,11 +539,11 @@ impl Platform for Host {
         }
     }
 
-    fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void> {
+    fn map_pages(&self, physical: &[u64], prot: u64) -> Option<*mut c_void> {
         self.map(
             physical.len(),
             |page| physical[page as usize],
-            Cache::WriteBack,
+            page_window::cache_of(prot),
         )
     }
 
@@ -836,7 +841,7 @@ impl GpuViews {
 }
 
 fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
-    use stela_loader::host_firmware::{bundle, recipes, requirements::Inventory};
+    use stela_loader::host_firmware::{recipes, requirements::Inventory};
     let chip = gpu::nouveau_chip::Chip::from_boot0(boot0).ok_or(ServiceError::Refused(
         "the GPU's PMC chipset is unsupported",
     ))?;
@@ -844,11 +849,38 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
     let mut inventory = Inventory::default();
     recipes::require_gsp(&mut inventory, &name)
         .map_err(|_| ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
+    firmware_from(&inventory, chip.name, catalog)
+}
+
+/// The GuC and HuC images xe loads on the Intel display controller with this
+/// device ID, as [`select_firmware`] does for nouveau's GSP-RM.
+#[cfg(feature = "xe")]
+fn select_intel_firmware(device: u16, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
+    use stela_loader::host_firmware::{recipes, requirements::Inventory};
+    let platform = recipes::xe_platform(device).ok_or(ServiceError::Refused(
+        "the GPU is no Intel part the xe port's firmware table names",
+    ))?;
+    let mut inventory = Inventory::default();
+    recipes::require_xe(&mut inventory, device)
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned xe recipe"))?;
+    firmware_from(&inventory, platform, catalog)
+}
+
+/// The images [`select_firmware`] and [`select_intel_firmware`] observed,
+/// bound to the exact names and target the driver will ask them under, or the
+/// refusal that says which of them the USB lacks. `label` names the part on
+/// the screen.
+fn firmware_from(
+    inventory: &stela_loader::host_firmware::requirements::Inventory,
+    label: &str,
+    catalog: Arc<Catalog>,
+) -> Result<PciFirmware, ServiceError> {
+    use stela_loader::host_firmware::{bundle, recipes};
+    let name = label;
     let mut names = Vec::new();
-    let request = inventory
-        .requests()
-        .first()
-        .ok_or(ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
+    let request = inventory.requests().first().ok_or(ServiceError::Refused(
+        "the GPU has no pinned firmware recipe",
+    ))?;
     let target = FirmwareTarget::new(
         request.target.driver.clone(),
         request.target.hardware.clone(),
@@ -856,7 +888,7 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
         request.target.board.clone(),
     )
     .map_err(|_| ServiceError::Refused("the GPU firmware target is invalid"))?;
-    let plan = recipes::Plan::select(&inventory)
+    let plan = recipes::Plan::select(inventory)
         .map_err(|_| ServiceError::Refused("the GPU firmware recipe cannot be selected"))?;
     // SAFETY: the reference count is never given back, so the catalog
     // stays allocated for every image borrowed from it for the boot.
@@ -939,72 +971,61 @@ pub(super) struct Claimed {
     link: Option<PcieLink>,
 }
 
-fn claim(
+/// What a port's register aperture looks like in BAR0. NVIDIA's BAR0 leaves
+/// the PCI prefetchable bit clear; Intel's DVD/`xe` register BAR sets it, so
+/// the bit identifies the register BAR for one port and not for the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegisterBar {
+    /// BAR0 leaves the prefetchable bit clear, as NVIDIA's does.
+    NotPrefetchable,
+    /// BAR0 may be prefetchable, as Intel's is.
+    #[cfg(feature = "xe")]
+    MaybePrefetchable,
+}
+
+/// The regions of the memory BARs a function decodes, with the resources that
+/// own them, as [`claim_memory_bars`] returns them.
+type DecodedBars = (Vec<Range<u64>>, ManuallyDrop<Vec<owned::Resource>>);
+
+/// Every memory BAR `function` decodes, as Linux sees the resources, with
+/// `placement`'s own regions filled in: BAR sizing temporarily turns off
+/// memory decode, and a BAR the host bridge translated is refused rather
+/// than mapped at an address the function does not read.
+fn claim_memory_bars(
     services: &dyn NativeServices,
-    adapter: &gpu::Adapter,
-    line: u32,
-    gop: crate::pci_io::ScreenOwner,
-    catalog: Arc<Catalog>,
-) -> Result<Claimed, ServiceError> {
-    use crate::pci_io::ScreenOwner;
-    let address = adapter.address;
-    let timer = services.minimum_delay()?;
-    let mut requester = services.prepare_requester(address)?;
-    let bus_reset = requester.bus_reset_available();
-    let function = requester.function_mut();
-    if (function.vendor, function.device, function.class) != (0x10de, adapter.device, adapter.class)
-    {
-        return Err(ServiceError::Refused("the GPU's original identity changed"));
-    }
-    let translated = services.dma_translated(address);
-    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
-        .map_err(|error| cold_refusal(address, error))?;
-    let owns_screen = match gop {
-        ScreenOwner::Function(source) if source.address == address => {
-            source.bar.words().try_for_each(|(offset, expected)| {
-                let observed = function
-                    .config()
-                    .read32(offset)
-                    .map_err(ServiceError::Config)?;
-                if observed != expected {
-                    return Err(ServiceError::Config(ConfigError::before_effect(
-                        ConfigFailure::Readback {
-                            offset,
-                            width: 4,
-                            expected,
-                            observed,
-                        },
-                    )));
-                }
-                Ok(())
-            })?;
-            true
-        }
-        // Any GPU may show the screen, so none starts beside its writer.
-        ScreenOwner::Unknown => true,
-        ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
-    };
-    // BAR sizing below temporarily turns off memory decode.
-    if owns_screen && !crate::console::retire_firmware() {
-        return Err(ServiceError::Refused(
-            "a firmware framebuffer writer is still active",
-        ));
-    }
-    let mut placement = Placement {
-        bus: address.bus,
-        devfn: address.device << 3 | address.function,
-        irq: line,
-        dma_limit: DMA_LIMIT,
-        ..Placement::default()
-    };
+    function: &mut Function<OwnedConfig>,
+    address: stela_drivers::bus::pci::Address,
+    placement: &mut Placement,
+    register_bar: RegisterBar,
+) -> Result<DecodedBars, ServiceError> {
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if !matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
-        || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
-    {
-        return Err(ServiceError::Refused(
-            "the GPU's register BAR does not decode",
+    match function_bars[0] {
+        Some(Bar::Memory { size, .. }) if size < PAGE => {
+            return Err(ServiceError::Refused(
+                "the GPU's register BAR is smaller than a page",
+            ));
+        }
+        Some(Bar::Memory { prefetchable, .. })
+            if prefetchable && register_bar == RegisterBar::NotPrefetchable =>
+        {
+            return Err(ServiceError::Refused(
+                "the GPU's register BAR is prefetchable",
+            ));
+        }
+        Some(Bar::Memory { .. }) => {}
+        _ => {
+            return Err(ServiceError::Refused(
+                "the GPU's register BAR is not memory",
+            ));
+        }
+    }
+    let command = function.config().read16(4).map_err(ServiceError::Config)?;
+    if command & regs::COMMAND_MEMORY == 0 {
+        output::arguments(format_args!(
+            "GPU {address}: its command register reads {command:#06x}\n"
         ));
+        return Err(ServiceError::Refused("the GPU's memory decoding is off"));
     }
     for (region, bar) in placement.regions.iter_mut().zip(function_bars) {
         let Some(
@@ -1039,6 +1060,85 @@ fn claim(
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
     }
+    Ok((bars, resources))
+}
+
+/// Join the firmware's own framebuffer writer when this function is the one
+/// showing the screen, which BAR sizing's temporary decode-off would
+/// otherwise disturb. Any GPU may show the screen, so an unknown writer is
+/// joined too; `Err` when it cannot be.
+fn retire_screen_writer(
+    function: &mut Function<OwnedConfig>,
+    address: stela_drivers::bus::pci::Address,
+    gop: crate::pci_io::ScreenOwner,
+) -> Result<(), ServiceError> {
+    use crate::pci_io::ScreenOwner;
+    let owns_screen = match gop {
+        ScreenOwner::Function(source) if source.address == address => {
+            source.bar.words().try_for_each(|(offset, expected)| {
+                let observed = function
+                    .config()
+                    .read32(offset)
+                    .map_err(ServiceError::Config)?;
+                if observed != expected {
+                    return Err(ServiceError::Config(ConfigError::before_effect(
+                        ConfigFailure::Readback {
+                            offset,
+                            width: 4,
+                            expected,
+                            observed,
+                        },
+                    )));
+                }
+                Ok(())
+            })?;
+            true
+        }
+        ScreenOwner::Unknown => true,
+        ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
+    };
+    if owns_screen && !crate::console::retire_firmware() {
+        return Err(ServiceError::Refused(
+            "a firmware framebuffer writer is still active",
+        ));
+    }
+    Ok(())
+}
+
+fn claim(
+    services: &dyn NativeServices,
+    adapter: &gpu::Adapter,
+    line: u32,
+    gop: crate::pci_io::ScreenOwner,
+    catalog: Arc<Catalog>,
+) -> Result<Claimed, ServiceError> {
+    let address = adapter.address;
+    let timer = services.minimum_delay()?;
+    let mut requester = services.prepare_requester(address)?;
+    let bus_reset = requester.bus_reset_available();
+    let function = requester.function_mut();
+    if (function.vendor, function.device, function.class) != (0x10de, adapter.device, adapter.class)
+    {
+        return Err(ServiceError::Refused("the GPU's original identity changed"));
+    }
+    let translated = services.dma_translated(address);
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
+        .map_err(|error| cold_refusal(address, error))?;
+    retire_screen_writer(function, address, gop)?;
+    let mut placement = Placement {
+        bus: address.bus,
+        devfn: address.device << 3 | address.function,
+        irq: line,
+        dma_limit: DMA_LIMIT,
+        ..Placement::default()
+    };
+    let (bars, resources) = claim_memory_bars(
+        services,
+        function,
+        address,
+        &mut placement,
+        RegisterBar::NotPrefetchable,
+    )?;
     let config = function
         .config()
         .retain_epoch()
@@ -1164,6 +1264,139 @@ fn claim(
         drm,
         #[cfg(feature = "nvk")]
         link,
+    })
+}
+
+/// The MSI capability Linux may route this function's interrupt through,
+/// which the port's own handler then serves.
+#[cfg(feature = "xe")]
+fn claim_msi(function: &mut Function<OwnedConfig>) -> Result<Option<Msi>, ServiceError> {
+    let capabilities = function
+        .capabilities()
+        .map_err(ServiceError::PciCapability)?;
+    Ok(capabilities
+        .iter()
+        .find(|(_, id)| *id == MSI_CAPABILITY)
+        .map(|(offset, _)| Msi::at(u16::from(*offset))))
+}
+
+/// Claim an Intel display controller for the xe port, as [`claim`] does for
+/// nouveau: its original configuration, its decoded memory BARs and the
+/// firmware xe asks for, all retained before Linux sees the function.
+///
+/// Xe3P's GT is left in the state firmware left it, which is where xe's own
+/// probe starts: the reset policy is [`gpu::cold`]'s, so a function with no
+/// function-local reset is only claimed when the mount translates its DMA.
+#[cfg(feature = "xe")]
+fn claim_intel(
+    services: &dyn NativeServices,
+    adapter: &gpu::Adapter,
+    line: u32,
+    gop: crate::pci_io::ScreenOwner,
+    catalog: Arc<Catalog>,
+) -> Result<Claimed, ServiceError> {
+    let address = adapter.address;
+    let timer = services.minimum_delay()?;
+    let mut requester = services.prepare_requester(address)?;
+    let bus_reset = requester.bus_reset_available();
+    let function = requester.function_mut();
+    if (function.vendor, function.device, function.class) != (0x8086, adapter.device, adapter.class)
+    {
+        return Err(ServiceError::Refused("the GPU's original identity changed"));
+    }
+    let translated = services.dma_translated(address);
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
+        .map_err(|error| cold_refusal(address, error))?;
+    retire_screen_writer(function, address, gop)?;
+    let mut placement = Placement {
+        bus: address.bus,
+        devfn: address.device << 3 | address.function,
+        irq: line,
+        dma_limit: INTEL_DMA_LIMIT,
+        ..Placement::default()
+    };
+    let (bars, resources) = claim_memory_bars(
+        services,
+        function,
+        address,
+        &mut placement,
+        RegisterBar::MaybePrefetchable,
+    )?;
+    let config = function
+        .config()
+        .retain_epoch()
+        .map_err(ServiceError::Mapping)?;
+    let pci_words = gpu_pci_words(function).map_err(ServiceError::Config)?;
+    let firmware = select_intel_firmware(adapter.device, catalog)?;
+    let registers = services
+        .authority()?
+        .map(
+            resources[0].clone(),
+            0,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .map_err(ServiceError::Mapping)?;
+    // The one register the seal below rechecks, through this exact mapping.
+    let sealed = registers.read32(0).map_err(ServiceError::Mapping)?;
+    crate::host_inventory::text(
+        alloc::format!("GPU{line}PCIID"),
+        alloc::format!("8086:{:04x}", adapter.device),
+    );
+    let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
+        requester,
+        views: GpuViews {
+            config,
+            pci_words,
+            registers,
+            boot0: sealed,
+        },
+        timer,
+    });
+    if translated {
+        // SAFETY: the mount's active remapper translates this requester, and
+        // its private domain is the one the cold attempt binds.
+        cold = unsafe { cold.translated() };
+    }
+    let ready = cold
+        .quiesce_and_bind()
+        .map_err(|failure| cold_refusal(address, failure.error))?;
+    match ready.reset() {
+        None => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; started as firmware left it, DMA translated\n"
+        )),
+        Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; reset through its bridge's secondary bus\n"
+        )),
+        Some(gpu::cold::Reset::Function(_)) => output::arguments(format_args!(
+            "GPU {address}: reset through its function before xe starts it\n"
+        )),
+    }
+    // SAFETY: both original owners transfer into this retained function
+    // lifetime before Linux probe.
+    let (bound, views) = unsafe { ready.into_parts() };
+    let attachment = ManuallyDrop::new(bound.attachment);
+    let mut function = ManuallyDrop::new(bound.requester.into_function());
+    let mut views = ManuallyDrop::new(views);
+    views
+        .check(&mut function)
+        .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    let msi = claim_msi(&mut function)?;
+    // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
+    unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
+    Ok(Claimed {
+        device: Device {
+            config: SharedConfig(Rc::new(RefCell::new(ManuallyDrop::into_inner(function)))),
+            msi,
+            custody: FunctionCustody::new(ManuallyDrop::into_inner(attachment)),
+            _views: views,
+            _resources: resources,
+        },
+        firmware,
+        placement,
+        bars,
+        name: format!("{address}"),
     })
 }
 
@@ -1300,8 +1533,40 @@ pub(super) struct Refused {
     pub(super) reason: stela_boot_core::gpu_status::Reason,
 }
 
-/// Claim every NVIDIA adapter, each reported if it cannot be, and the ones
-/// refused. In a foreground continuation, with probe finished.
+/// Whether this image carries a port that binds `vendor`'s display
+/// controllers: nouveau's NVIDIA GPUs with the `nvk` image, xe's Intel
+/// integrated ones with the xe port. An image carries one port at a time, and
+/// naming a vendor here claims nothing by itself.
+fn ported_vendor(vendor: gpu::Vendor) -> bool {
+    match vendor {
+        gpu::Vendor::Nvidia => cfg!(feature = "nvk"),
+        gpu::Vendor::Intel => cfg!(feature = "xe"),
+        _ => false,
+    }
+}
+
+/// The port that claims `adapter`, by its vendor: nouveau's own sequence for
+/// an NVIDIA GPU, the xe port's for an Intel display controller.
+fn claim_adapter(
+    services: &dyn NativeServices,
+    adapter: &gpu::Adapter,
+    line: u32,
+    gop: crate::pci_io::ScreenOwner,
+    catalog: Arc<Catalog>,
+) -> Result<Claimed, ServiceError> {
+    match adapter.vendor {
+        gpu::Vendor::Nvidia => claim(services, adapter, line, gop, catalog),
+        #[cfg(feature = "xe")]
+        gpu::Vendor::Intel => claim_intel(services, adapter, line, gop, catalog),
+        _ => Err(ServiceError::Refused(
+            "no Stela GPU backend for this PCI vendor",
+        )),
+    }
+}
+
+/// Claim every adapter of every vendor this image's ports bind, each reported
+/// if it cannot be, and the ones refused. In a foreground continuation, with
+/// probe finished.
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
@@ -1316,7 +1581,7 @@ pub(super) fn claim_all(
     };
     for adapter in adapters
         .iter()
-        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
+        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia && !ported_vendor(adapter.vendor))
     {
         output::arguments(format_args!(
             "GPU {} vendor={:?} device={:04x} unused: {}\n",
@@ -1329,8 +1594,8 @@ pub(super) fn claim_all(
     let nvidia = adapters
         .iter()
         .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
+    let mut refused = Vec::new();
     if !cfg!(feature = "nvk") {
-        let mut refused = Vec::new();
         for adapter in nvidia {
             output::arguments(format_args!(
                 "GPU {} left with firmware: build the image with `cargo xtask boot build`\n",
@@ -1338,25 +1603,31 @@ pub(super) fn claim_all(
             ));
             refused.push(refused_as(adapter, Reason::Other));
         }
+    }
+    // No port at all: nothing below would claim anything.
+    if !cfg!(any(feature = "nvk", feature = "xe")) {
         return (Vec::new(), refused);
     }
     let mut claimed = Vec::new();
-    let mut refused = Vec::new();
+    let ported: Vec<&gpu::Adapter> = adapters
+        .iter()
+        .filter(|adapter| ported_vendor(adapter.vendor))
+        .collect();
     let source = match gop {
         Ok(source) => source,
         Err(why) => {
-            for adapter in nvidia {
+            for adapter in ported {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
                 refused.push(refused_as(adapter, Reason::Other));
             }
             return (claimed, refused);
         }
     };
-    for adapter in nvidia {
+    for adapter in ported {
         let result = catalog
             .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
             .and_then(|catalog| {
-                claim(
+                claim_adapter(
                     services,
                     adapter,
                     claimed.len() as u32,
@@ -1379,6 +1650,16 @@ pub(super) fn claim_all(
     (claimed, refused)
 }
 
+/// The name of the port this image carries (one at a time), for the lines
+/// that say which driver bound a GPU.
+const PORT: &str = if cfg!(feature = "nvk") {
+    "nouveau"
+} else if cfg!(feature = "xe") {
+    "xe"
+} else {
+    "no port"
+};
+
 /// A GPU nouveau bound.
 #[cfg(feature = "nvk")]
 struct Bound {
@@ -1398,6 +1679,9 @@ struct Started {
     _attached: Vec<Attached<Device>>,
     #[cfg(feature = "nvk")]
     bound: Vec<Bound>,
+    /// Each GPU the xe port bound, by function, for the boot's own report.
+    #[cfg(feature = "xe")]
+    bound: Vec<String>,
     result: Result<(), Errno>,
 }
 
@@ -1419,10 +1703,20 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         _attached: Vec::new(),
         #[cfg(feature = "nvk")]
         bound: Vec::new(),
+        #[cfg(feature = "xe")]
+        bound: Vec::new(),
         result: Ok(()),
     };
-    // SAFETY: entered, on a task.
-    job.result = unsafe { gpu::nouveau::start() };
+    #[cfg(feature = "nvk")]
+    {
+        // SAFETY: entered, on a task.
+        job.result = unsafe { gpu::nouveau::start() };
+    }
+    #[cfg(feature = "xe")]
+    {
+        // SAFETY: entered, on a task.
+        job.result = unsafe { gpu::xe::start() };
+    }
     if job.result.is_err() {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
@@ -1469,10 +1763,12 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         drm: claimed.drm,
                         link: claimed.link,
                     });
+                    #[cfg(feature = "xe")]
+                    job.bound.push(claimed.name.clone());
                 } else {
                     output::arguments(format_args!(
-                        "GPU {}: nouveau did not bind it\n",
-                        claimed.name
+                        "GPU {}: {} did not bind it\n",
+                        claimed.name, PORT
                     ));
                 }
                 job._attached.push(attached);
@@ -1565,7 +1861,15 @@ pub(super) fn no_metal_device() -> Option<&'static str> {
     return gate::shared()
         .is_empty()
         .then_some("no GPU started; the lines above say why");
-    #[cfg(not(feature = "nvk"))]
+    // The xe port drives the host's Intel GPU for Linux, but the guest's
+    // Metal device comes from NVK over the linked Mesa, which only the `nvk`
+    // image carries.
+    #[cfg(all(not(feature = "nvk"), feature = "xe"))]
+    return Some(
+        "this stela.efi carries the xe port only, which drives the GPU without the \
+         guest's Metal device the `nvk` image carries",
+    );
+    #[cfg(not(any(feature = "nvk", feature = "xe")))]
     Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
 }
 
@@ -1618,7 +1922,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     } = machine;
     let image = work.image()?;
     let task_data = work.task_data()?;
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "xe"))]
     let claiming = !claimed.is_empty();
     let lines = claimed
         .iter()
@@ -1706,7 +2010,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         ))
     })??;
     let result = job.result.map_err(Error::Init);
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "xe"))]
     let result = result.and_then(|()| {
         if claiming && job.bound.is_empty() {
             Err(Error::NoDevices)
@@ -1908,7 +2212,7 @@ pub(super) enum Error {
     Child(Outcome),
     Init(Errno),
     Timeout,
-    #[cfg(feature = "nvk")]
+    #[cfg(any(feature = "nvk", feature = "xe"))]
     NoDevices,
 }
 
@@ -1933,8 +2237,8 @@ impl core::fmt::Display for Error {
             Self::Timeout => {
                 f.write_str("GPU startup exceeded its deadline; native owners remain held")
             }
-            #[cfg(feature = "nvk")]
-            Self::NoDevices => f.write_str("nouveau bound no NVIDIA GPUs"),
+            #[cfg(any(feature = "nvk", feature = "xe"))]
+            Self::NoDevices => write!(f, "{PORT} bound no GPU this image drives"),
         }
     }
 }
