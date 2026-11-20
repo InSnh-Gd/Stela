@@ -1,4 +1,5 @@
-//! NVK, NIR and NAK for `stela.efi`.
+//! The image's Vulkan drivers, NIR and their compilers: NVK with NIR and NAK
+//! over nouveau, and ANV over xe.
 //!
 //! Meson configures Mesa for `sysroot`'s machine, the same from every build
 //! host, which leaves its generated sources and its compile plan. This task
@@ -7,6 +8,9 @@
 //! links it. Mesa's Rust builds as ordinary Cargo dependencies of the image,
 //! from sources generated here. Mesa itself stays unpatched: what differs is
 //! the C library, the configuration below and the units in `compat/mesa`.
+//! The Intel drivers bring OpenCL shaders, and Mesa brings GLSL of its own,
+//! that Meson compiles with programs of the build machine ([`NATIVE_TOOLS`]);
+//! nothing else here runs off the C target.
 use super::{
     support::{NATIVE_TARGET, build_directory, capture, gpu, slashed, third_party, tool},
     sysroot::Sysroot,
@@ -27,14 +31,15 @@ use std::{
     time::SystemTime,
 };
 
-/// What NVK needs and nothing else: no window system, no cache on
-/// disk and no host compiler. NVK's OpenCL kernels are `compat/mesa/nvkcl.c`, so
-/// the tools that would build them are never run. A release build: NDEBUG drops
-/// NIR validation after every pass and NAK's debug assertions, which cost the
-/// image compile time and heap; the host compiler lane keeps them.
+/// What the image's Vulkan drivers need and nothing else: no window system, no
+/// cache on disk and no host compiler. NVK's OpenCL kernels are
+/// `compat/mesa/nvkcl.c`, so the tools that would build them are never run. A
+/// release build: NDEBUG drops NIR validation after every pass and NAK's debug
+/// assertions, which cost the image compile time and heap; the host compiler
+/// lane keeps them.
 pub(super) const OPTIONS: [&str; 21] = [
     "-Dcpp_rtti=false",
-    "-Dvulkan-drivers=nouveau",
+    "-Dvulkan-drivers=nouveau,intel",
     "-Dgallium-drivers=",
     "-Dplatforms=",
     "-Dopengl=false",
@@ -59,27 +64,24 @@ pub(super) const OPTIONS: [&str; 21] = [
 /// size, which `ralloc_total_size` sums for the Metal compiler's NIR budget.
 /// The block header is private to the unit and its size is the same either way.
 const SIZED_UNIT: &str = "src/util/ralloc.c";
-/// The Vulkan drivers the image links, as Meson's targets.
-const DRIVERS: [&str; 1] = ["src/nouveau/vulkan/libvulkan_nouveau.so"];
-/// Tools the configuration asks for that nothing runs.
-const UNUSED_TOOLS: [&str; 2] = ["mesa_clc", "vtn_bindgen2"];
-/// What Mesa's configuration asks of `glslangValidator`, only for the compute
-/// shaders that build acceleration structures and decode ASTC in Vulkan's
-/// runtime. The device enables neither, as no Metal path uses them, so they
-/// compile to an empty SPIR-V module.
-const GLSLANG: &str = r#"#!/usr/bin/env python3
-import sys
-arguments = sys.argv[1:]
-if "--version" in arguments:
-    print("Glslang Version: 11:15.1.0")
-    raise SystemExit
-output = arguments[arguments.index("-o") + 1]
-with open(output, "w") as file:
-    file.write("0x07230203, 0x00010500, 0, 1, 0,\n")
-if "--depfile" in arguments:
-    with open(arguments[arguments.index("--depfile") + 1], "w") as file:
-        file.write(output + ":\n")
-"#;
+/// The Vulkan drivers the image links, as Meson's targets: NVK over nouveau for
+/// NVIDIA's GPUs, and ANV over xe for Intel's, which is the Metal device an
+/// [`crate::gpu`] `xe` port gives macOS.
+const DRIVERS: [&str; 2] = [
+    "src/nouveau/vulkan/libvulkan_nouveau.so",
+    "src/intel/vulkan/libvulkan_intel.so",
+];
+/// Mesa's build-machine programs, which this build runs as the image's C target
+/// cannot. `mesa_clc` compiles the Intel drivers' OpenCL shaders (Blorp's, and
+/// the kernels generated draws run) and `vtn_bindgen2` turns their SPIR-V into
+/// the NIR those drivers are built from; both are Meson's `native: true`
+/// programs, so they come from `.tools/gpu/mesa-clc`, which
+/// `mesa-clc-native.nix` builds from this very tree. `glslangValidator` is
+/// Mesa's own requirement, for the GLSL it hands to a compiler rather than to
+/// `mesa_clc`: Vulkan's runtime shaders, and ANV's `float64.glsl`, the software
+/// double-precision library that stands in for hardware without it. The
+/// development environment carries that one, as nothing in this tree does.
+const NATIVE_TOOLS: [&str; 3] = ["mesa_clc", "vtn_bindgen2", "glslangValidator"];
 /// `.pc` files for what Mesa's configuration requires: libdrm's headers are
 /// vendored and its calls are `compat/mesa/drm.c`; the one user of libelf is
 /// `compat/mesa/nv_cubin.c`.
@@ -88,19 +90,30 @@ const LIBELF_VERSION: &str = "0.190";
 
 /// Units not built, by a part of their source path: each either has a stand-in
 /// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
-/// The libraries Meson links whole, by their objects' names.
-const WHOLE_LIBRARIES: [&str; 4] = [
+/// The libraries Meson links whole, by their objects' names: a driver reaches
+/// its own entry points and its per-generation shaders only by weak reference,
+/// which pulls no member from an archive. Mesa links each of these whole
+/// (`src/intel/vulkan/meson.build`, `src/nouveau/vulkan/meson.build`,
+/// `src/vulkan/wsi/meson.build`, `src/vulkan/runtime/meson.build`).
+///
+/// The per-generation Intel libraries are `libanv_per_hw_ver<version>.a`
+/// (`libanv_per_hw_ver350.a` for this PC's Arc): their object names carry the
+/// version, so they are matched by the prefix alone.
+const WHOLE_LIBRARIES: [&str; 7] = [
     "libvulkan_lite_runtime_a",
     "libvulkan_runtime_a",
     "libvulkan_instance_a",
+    "libvulkan_wsi_a",
     "libnvk_a",
+    "libanv_common_a",
+    "libanv_per_hw_ver",
 ];
 
 const SKIPPED: [&str; 11] = [
     "nvkcl",
     "build_id",
     "nv_cubin.c",
-    "texcompress_astc",
+    "futex.c",
     "u_qsort",
     "os_file_notify",
     "os_socket",
@@ -110,11 +123,13 @@ const SKIPPED: [&str; 11] = [
     "wsi_common_display",
 ];
 /// Stela's stand-ins, under `compat/mesa`, built with an NVK unit's flags.
-const STAND_INS: [&str; 7] = [
+const STAND_INS: [&str; 9] = [
     "nvkcl",
     "build_id",
     "nv_cubin",
+    "anv_nir_options",
     "drm",
+    "futex",
     "soft_float",
     "nir_options",
     "submit_thread",
@@ -139,6 +154,10 @@ const AIR: [&str; 16] = [
     "threadgroup",
 ];
 const MODEL_UNIT: &str = "nvk_query_pool.c";
+/// The Intel stand-ins' model unit: an ANV unit's command carries the Vulkan
+/// driver's own and the Intel compiler's include directories, which a
+/// stand-in that reads `anv_private.h` needs and NVK's model unit lacks.
+const INTEL_MODEL_UNIT: &str = "anv_device.c";
 /// The C library, under `compat/libc`.
 pub(super) const LIBC: [&str; 6] = ["libc", "stdio", "pthread", "math", "system", "wchar"];
 /// Original LLVM units behind `compat/libc/regex.h`, also present in the
@@ -163,10 +182,14 @@ pub(super) const LATE_DEFINES: [&str; 3] = [
     "VK_USE_PLATFORM_HEADLESS_EXT",
 ];
 /// What the image has without the probes finding it: `HAVE_DL_ITERATE_PHDR`
-/// declares the build ID that `compat/mesa/build_id.c` provides.
-pub(super) const ADDED_DEFINES: [&str; 6] = [
+/// declares the build ID that `compat/mesa/build_id.c` provides, and
+/// `HAVE_LINUX_FUTEX_H` the futex that `compat/mesa/futex.c` does, out of the
+/// host's own wait and wake. Mesa asks for the header of that name, which the
+/// image has no reason to carry.
+pub(super) const ADDED_DEFINES: [&str; 7] = [
     "STELA_LIBC",
     "HAVE_DL_ITERATE_PHDR",
+    "HAVE_LINUX_FUTEX_H",
     "BLAKE3_NO_SSE2",
     "BLAKE3_NO_SSE41",
     "BLAKE3_NO_AVX2",
@@ -247,21 +270,32 @@ pub(super) struct Unit {
     pub(super) arguments: Vec<String>,
 }
 
-fn paths(directory: &Path) -> Result<(PathBuf, PathBuf)> {
-    let stubs = directory.join("tools");
+fn paths() -> Result<PathBuf> {
     let local = tools::root().join(".tools/gpu");
     let path = std::env::join_paths(
         [
-            stubs.clone(),
             local.join(GENERATORS),
             local.join("rust/bin"),
+            local.join("mesa-clc/bin"),
         ]
         .into_iter()
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         )),
     )?;
-    Ok((stubs, path.into()))
+    Ok(path.into())
+}
+
+/// The [`NATIVE_TOOLS`] Meson's `find_program(..., native: true)` will not find,
+/// by name: the build's own PATH holds where they are installed, not this
+/// process'.
+fn missing_native_tools(path: &Path) -> Vec<&'static str> {
+    NATIVE_TOOLS
+        .into_iter()
+        .filter(|name| {
+            !std::env::split_paths(path).any(|directory| directory.join(name).is_file())
+        })
+        .collect()
 }
 
 fn setup(
@@ -285,18 +319,6 @@ fn setup(
         fs::remove_dir_all(build)?;
     }
     fs::write(&machine, description)?;
-    let (stubs, _) = paths(directory)?;
-    fs::create_dir_all(&stubs)?;
-    let unused = UNUSED_TOOLS.map(|name| (name, "#!/usr/bin/env python3\nraise SystemExit(1)\n"));
-    for (name, script) in unused.into_iter().chain([("glslangValidator", GLSLANG)]) {
-        let stub = stubs.join(name);
-        fs::write(&stub, script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
-        }
-    }
     fs::create_dir_all(&packages)?;
     let libdrm = third_party("libdrm");
     fs::write(
@@ -604,6 +626,7 @@ fn units(
         serde_json::from_str(&fs::read_to_string(build.join("compile_commands.json"))?)?;
     let mut units = Vec::new();
     let mut model = None;
+    let mut intel_model = None;
     let entries = database.as_array().context("compile database")?;
     // A source two libraries compile is the one's that is linked whole.
     let whole: BTreeSet<&str> = entries
@@ -625,6 +648,9 @@ fn units(
         if file.ends_with(MODEL_UNIT) {
             model = Some((file.to_owned(), words.clone()));
         }
+        if file.ends_with(INTEL_MODEL_UNIT) {
+            intel_model = Some((file.to_owned(), words.clone()));
+        }
         if file.ends_with(".S")
             || SKIPPED
                 .iter()
@@ -632,7 +658,9 @@ fn units(
         {
             continue;
         }
-        let is_cxx = file.ends_with(".cpp");
+        // Mesa spells its C++ both ways: NVK's and ANV's compilers are `.cpp`,
+        // the Intel driver's tracepoints are `.cc`.
+        let is_cxx = file.ends_with(".cpp") || file.ends_with(".cc");
         ensure!(
             is_cxx || file.ends_with(".c"),
             "{file} is neither C nor C++"
@@ -678,9 +706,20 @@ fn units(
     };
     let model_unit =
         |source: &Path, name: &str, added: &[String]| like(&file, &words, source, name, added);
+    let (intel_file, intel_words) = intel_model.context("no Intel model unit")?;
+    let intel_model_unit = |source: &Path, name: &str, added: &[String]| {
+        like(&intel_file, &intel_words, source, name, added)
+    };
     for name in STAND_INS {
         let source = compat.join("mesa").join(format!("{name}.c"));
-        units.push(model_unit(&source, name, &[]));
+        // A stand-in reads the headers of the driver it stands in for, so it
+        // is compiled with a unit of that driver: NVK's own for NVK's, and an
+        // Intel driver unit's for the Intel driver's.
+        units.push(if name.starts_with("anv_") {
+            intel_model_unit(&source, name, &[])
+        } else {
+            model_unit(&source, name, &[])
+        });
     }
     let compiler = gpu().join("compiler");
     let added = [
@@ -819,7 +858,16 @@ pub fn build(jobs: u16) -> Result<()> {
     let toolchain = super::toolchain::discover()?;
     let directory = build_directory("nvk");
     let build = directory.join("build");
-    let (_, path) = paths(&directory)?;
+    let path = paths()?;
+    let missing = missing_native_tools(&path);
+    ensure!(
+        missing.is_empty(),
+        "this build needs {}, Mesa's build-machine programs, where its PATH looks: \
+         `.tools/gpu/mesa-clc/bin' for the two Meson builds from this tree (`mesa-clc-native.nix` \
+         builds them; Meson reports their absence only as a program it cannot find), and the \
+         development environment for `glslangValidator`, which is Mesa's own requirement.",
+        missing.join(" and "),
+    );
     fs::create_dir_all(&directory)?;
     super::llvm::build(&toolchain, jobs, false)?;
     let sysroot = Sysroot::build(&toolchain, &directory, jobs)?;

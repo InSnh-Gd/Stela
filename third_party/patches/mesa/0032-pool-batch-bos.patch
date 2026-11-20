@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: InSnh-Gd <2479955131@qq.com>
+Date: Wed, 18 Nov 2026 12:15:52 +0000
+Subject: [PATCH] anv: pool batch BOs and keep slab/host-transfer BOs mapped
+ under STELA_LIBC
+
+---
+ src/intel/vulkan/anv_allocator.c | 35 ++++++++++++++++
+ src/intel/vulkan/anv_image.c     | 69 ++++++++++++++++++++++++--------
+ src/intel/vulkan/anv_private.h   |  9 +++++
+ src/intel/vulkan/anv_slab_bo.c   |  8 ++++
+ 4 files changed, 105 insertions(+), 16 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index a87cc926b8c2b64952b98145bf7e73f99645455d..195d5042384a8411699a9ba48aedc0dc29aa4cc0 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1538,6 +1538,12 @@ anv_bo_unmap_close(struct anv_device *device, struct anv_bo *bo)
+ {
+    if (bo->map && !bo->from_host_ptr)
+       anv_device_unmap_bo(device, bo, bo->map, bo->size, false /* replace */);
++#ifdef STELA_LIBC
++   if (bo->host_copy_map && !bo->from_host_ptr) {
++      anv_device_unmap_bo(device, bo, bo->host_copy_map, bo->size, false /* replace */);
++      bo->host_copy_map = NULL;
++   }
++#endif
+ 
+    assert(bo->gem_handle != 0);
+    device->kmd_backend->gem_close(device, bo);
+@@ -1874,6 +1880,27 @@ anv_device_map_bo(struct anv_device *device,
+ 
+    struct anv_bo *real = anv_bo_get_real(bo);
+    uint64_t offset_adjustment = 0;
++#ifdef STELA_LIBC
++   /* Map each slab parent whole once until it is released so slab entries
++    * neither prefix-unmap nor unmap across every allocation and free.
++    */
++   if (real != bo && placed_addr == NULL) {
++      void *pmap = p_atomic_read(&real->map);
++      if (pmap == NULL) {
++         void *m = device->kmd_backend->gem_mmap(device, real, 0, real->size, NULL);
++         if (unlikely(m == MAP_FAILED))
++            return vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED, "mmap failed: %m");
++         pmap = p_atomic_cmpxchg(&real->map, NULL, m);
++         if (pmap != NULL)
++            anv_device_unmap_bo(device, real, m, real->size, false /* replace */);
++         else
++            pmap = m;
++      }
++      if (map_out)
++         *map_out = (char *)pmap + (bo->offset - real->offset) + offset;
++      return VK_SUCCESS;
++   }
++#endif
+    if (real != bo) {
+       if (placed_addr)
+          return map_placed_addr_slab(device, bo, offset, size, placed_addr, map_out);
+@@ -1916,6 +1943,14 @@ anv_device_unmap_bo(struct anv_device *device,
+    assert(!bo->from_host_ptr);
+ 
+    struct anv_bo *real = anv_bo_get_real(bo);
++#ifdef STELA_LIBC
++   /* Slab entry maps point into real->map, which the parent release unmaps. */
++   if (real != bo && !replace) {
++      char *pmap = p_atomic_read(&real->map);
++      if (pmap != NULL && (char *)map >= pmap && (char *)map < pmap + real->size)
++         return VK_SUCCESS;
++   }
++#endif
+    if (real != bo) {
+       const uint64_t page_size = device->physical->page_size;
+       uint64_t slab_offset = bo->offset - real->offset;
+diff --git a/src/intel/vulkan/anv_image.c b/src/intel/vulkan/anv_image.c
+index 270f885274b4e194c7d97138b3fb947085ad74c4..0fbf5dd30fd87daade0bbe4bb1ebf121f8072956 100644
+--- a/src/intel/vulkan/anv_image.c
++++ b/src/intel/vulkan/anv_image.c
+@@ -2341,7 +2341,12 @@ anv_image_finish(struct anv_image *image)
+    }
+ 
+    for (uint32_t b = 0; b < ARRAY_SIZE(image->bindings); b++) {
+-      if (image->bindings[b].host_map != NULL && !image->bindings[b].address.bo->from_host_ptr) {
++      if (image->bindings[b].host_map != NULL &&
++          !image->bindings[b].address.bo->from_host_ptr
++#ifdef STELA_LIBC
++          && !image->bindings[b].host_map_borrowed
++#endif
++          ) {
+          anv_device_unmap_bo(device,
+                              image->bindings[b].address.bo,
+                              image->bindings[b].host_map,
+@@ -3103,21 +3108,53 @@ anv_image_bind_address(struct anv_device *device,
+          image->bindings[binding].map_size = address.bo->size;
+          image->bindings[binding].map_delta = 0;
+       } else {
+-         uint64_t map_offset, map_size;
+-         anv_sanitize_map_params(device, image->bindings[binding].address.bo, offset,
+-                                 image->bindings[binding].memory_range.size,
+-                                 &map_offset, &map_size);
+-
+-         VkResult result = anv_device_map_bo(device,
+-                                             image->bindings[binding].address.bo,
+-                                             map_offset, map_size,
+-                                             NULL /* placed_addr */,
+-                                             &image->bindings[binding].host_map);
+-         if (result != VK_SUCCESS)
+-            return result;
+-
+-         image->bindings[binding].map_delta = (offset - map_offset);
+-         image->bindings[binding].map_size = map_size;
++#ifdef STELA_LIBC
++         /* Keep the backing BO mapped whole once until it closes so
++          * suballocated host-transfer images neither prefix-unmap on bind nor
++          * unmap inside vkDestroyImage.
++          */
++         struct anv_bo *real = anv_bo_get_real(address.bo);
++         void *pmap = NULL;
++         if (!real->from_host_ptr &&
++             anv_device_get_pat_entry(device, real->alloc_flags)->mmap !=
++                INTEL_DEVICE_INFO_MMAP_MODE_INVALID) {
++            pmap = p_atomic_read(&real->host_copy_map);
++            if (pmap == NULL) {
++               void *m = NULL;
++               if (anv_device_map_bo(device, real, 0, real->size, NULL, &m) == VK_SUCCESS) {
++                  pmap = p_atomic_cmpxchg(&real->host_copy_map, NULL, m);
++                  if (pmap != NULL)
++                     anv_device_unmap_bo(device, real, m, real->size, false /* replace */);
++                  else
++                     pmap = m;
++               }
++            }
++         }
++         if (pmap != NULL) {
++            image->bindings[binding].host_map =
++               (char *)pmap + (address.bo->offset - real->offset);
++            image->bindings[binding].map_size = real->size;
++            image->bindings[binding].map_delta = offset;
++            image->bindings[binding].host_map_borrowed = true;
++         } else
++#endif
++         {
++            uint64_t map_offset, map_size;
++            anv_sanitize_map_params(device, image->bindings[binding].address.bo, offset,
++                                    image->bindings[binding].memory_range.size,
++                                    &map_offset, &map_size);
++
++            VkResult result = anv_device_map_bo(device,
++                                                image->bindings[binding].address.bo,
++                                                map_offset, map_size,
++                                                NULL /* placed_addr */,
++                                                &image->bindings[binding].host_map);
++            if (result != VK_SUCCESS)
++               return result;
++
++            image->bindings[binding].map_delta = (offset - map_offset);
++            image->bindings[binding].map_size = map_size;
++         }
+       }
+    }
+ 
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index 3f600746040a9bcfed8cb7b9de05891408a5f8a4..a938b8616eb6da155632ba753f6a5046ee86bac8 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -460,6 +460,12 @@ struct anv_bo {
+     * BO.
+     */
+    void *map;
++#ifdef STELA_LIBC
++   /* Whole-BO mapping shared by suballocated host-transfer images until the
++    * BO closes.
++    */
++   void *host_copy_map;
++#endif
+ 
+    /* The actual size of bo allocated by kmd, basically:
+     * align(size, mem_alignment)
+@@ -5862,6 +5868,9 @@ struct anv_image {
+       void *host_map;
+       uint64_t map_delta;
+       uint64_t map_size;
++#ifdef STELA_LIBC
++      bool host_map_borrowed;
++#endif
+    } bindings[ANV_IMAGE_MEMORY_BINDING_END];
+ 
+    /**
+diff --git a/src/intel/vulkan/anv_slab_bo.c b/src/intel/vulkan/anv_slab_bo.c
+index aaa55e716aa0fbbb4f800b563fe5d83ec42e34f6..c877515d012e5a8f5cc363dffe278ec634f71a7d 100644
+--- a/src/intel/vulkan/anv_slab_bo.c
++++ b/src/intel/vulkan/anv_slab_bo.c
+@@ -49,6 +49,14 @@ anv_bo_alloc_flags_to_slab_heap(struct anv_device *device,
+                         ANV_BO_ALLOC_IMPLICIT_WRITE);
+    }
+ 
++#ifdef STELA_LIBC
++   /* Keep batch BOs out of slabs so device->batch_bo_pool caches their
++    * mappings across command buffers rather than unmapping on every free.
++    */
++   if (alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_FLAGS ||
++       alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS)
++      return ANV_BO_SLAB_NOT_SUPPORTED;
++#endif
+    if (alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_FLAGS ||
+        alloc_flags == ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS)
+       return ANV_BO_SLAB_HEAP_CACHED_COHERENT_CAPTURE;

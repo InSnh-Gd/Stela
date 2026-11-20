@@ -1,13 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+From: InSnh-Gd <2479955131@qq.com>
 Date: Sat, 14 Nov 2026 12:00:00 +0000
 Subject: [PATCH] fix(nouveau): turn the display off and free every channel
  before GSP unloads at power-off, and unload at level 0 as upstream does on
  removal
 
 ---
- drivers/gpu/drm/nouveau/nouveau_drm.c          | 33 +++++++++++++++++++++++++++++++++
- .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c  | 13 ++++++-------
+ drivers/gpu/drm/nouveau/nouveau_drm.c         | 33 +++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 13 ++++----
  2 files changed, 39 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c

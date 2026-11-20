@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: InSnh-Gd <2479955131@qq.com>
+Date: Mon, 16 Nov 2026 16:54:47 +0000
+Subject: [PATCH] anv: name the ICD entry point for a link beside another
+ driver
+
+Stela links Mesa's Vulkan drivers into the boot image rather than loading them
+through a loader, and two drivers define the loader interface's
+vk_icdGetInstanceProcAddr: one link cannot hold both. Under STELA_LIBC, which
+only that image's units define, the Intel driver's definition carries Stela's
+own name; the shared library keeps the loader's.
+---
+ src/intel/vulkan/anv_instance.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_instance.c b/src/intel/vulkan/anv_instance.c
+index c25e66acdb5a94ad454a15f11aba969970b9561a..bf2ce82d4c898d4c33c70f22df09d207e87809c0 100644
+--- a/src/intel/vulkan/anv_instance.c
++++ b/src/intel/vulkan/anv_instance.c
+@@ -309,6 +309,14 @@ PFN_vkVoidFunction anv_GetInstanceProcAddr(
+ /* With version 1+ of the loader interface the ICD should expose
+  * vk_icdGetInstanceProcAddr to work around certain LD_PRELOAD issues seen in apps.
+  */
++/* Stela links Mesa's drivers into the boot image instead of loading them
++ * through a loader, so two of them share one link and each one's loader
++ * interface name would collide. The Intel driver's carries Stela's own name
++ * there; NVK's keeps the loader's.
++ */
++#ifdef STELA_LIBC
++#define vk_icdGetInstanceProcAddr stela_anv_icd_get_instance_proc_addr
++#endif
+ PUBLIC
+ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(
+     VkInstance                                  instance,

@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: InSnh-Gd <2479955131@qq.com>
+Date: Tue, 17 Nov 2026 06:00:53 +0000
+Subject: [PATCH] anv: say which address space ran out, and print the layout
+
+---
+ src/intel/vulkan/anv_allocator.c | 28 +++++++++++++++++++++++++++-
+ src/intel/vulkan/anv_va.c        |  6 ++++--
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index 51e36e44c4032ad7df1a32286aef2349178a9ced..a87cc926b8c2b64952b98145bf7e73f99645455d 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1596,6 +1596,27 @@ anv_bo_vma_calc_alignment_requirement(struct anv_device *device,
+    return align;
+ }
+ 
++/* Stela: name the address space a BO could not be placed in, so the boot
++ * log says which one ran out.
++ */
++static const char *
++anv_vma_heap_kind(struct anv_device *device, const struct util_vma_heap *heap)
++{
++   if (heap == &device->vma_lo)
++      return "low";
++   if (heap == &device->vma_hi)
++      return "high";
++   if (heap == &device->vma_null_initialized)
++      return "null_initialized";
++   if (heap == &device->vma_desc)
++      return "descriptor_pool";
++   if (heap == &device->vma_dynamic_visible)
++      return "dynamic_visible_pool";
++   if (heap == &device->vma_trtt)
++      return "trtt";
++   return "unknown";
++}
++
+ static VkResult
+ anv_bo_vma_alloc_or_close(struct anv_device *device,
+                           struct anv_bo *bo,
+@@ -1629,7 +1650,12 @@ anv_bo_vma_alloc_or_close(struct anv_device *device,
+       if (bo->offset == 0) {
+          anv_bo_unmap_close(device, bo);
+          return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                          "failed to allocate virtual address for BO");
++                          "failed to allocate virtual address for BO (%s: free %" PRIu64
++                          " size %" PRIu64 " align %" PRIu64 " flags 0x%x explicit 0x%" PRIx64
++                          ")",
++                          anv_vma_heap_kind(device, bo->vma_heap),
++                          bo->vma_heap->free_size, bo->size, (uint64_t) align,
++                          (unsigned) alloc_flags, explicit_address);
+       }
+    }
+ 
+diff --git a/src/intel/vulkan/anv_va.c b/src/intel/vulkan/anv_va.c
+index 447a6aaeb474828e34a96ac9112136886542918d..d8f08aa221a9971df5c26f02b5826fad52a979fd 100644
+--- a/src/intel/vulkan/anv_va.c
++++ b/src/intel/vulkan/anv_va.c
+@@ -180,6 +180,8 @@ anv_physical_device_init_va_ranges(struct anv_physical_device *device)
+    assert(address <= trtt_start);
+    address = va_add(&device->va.trtt, trtt_start, trtt_end - trtt_start);
+ 
+-   if (INTEL_DEBUG(DEBUG_HEAPS))
+-      anv_device_print_vas(device);
++   /* Stela: the port needs this in the boot log, where there is no
++    * environment to set INTEL_DEBUG in.
++    */
++   anv_device_print_vas(device);
+ }
