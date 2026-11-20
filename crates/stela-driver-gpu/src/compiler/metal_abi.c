@@ -1715,6 +1715,7 @@ static void encode_planes_texel(nir_builder *b, const struct texels *t, nir_def 
    nir_def *stored = nir_image_deref_load(b, 4, 32, &t->image->def, coord, nir_undef(b, 1, 32),
                                           nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
                                           .image_array = true, .format = PIPE_FORMAT_NONE,
+                                          .access = ACCESS_COHERENT,
                                           .dest_type = nir_type_uint32);
    nir_def *rg = nir_channel(b, stored, 0), *ba = nir_channel(b, stored, 1);
    nir_def *r = nir_f2f32(b, nir_unpack_32_2x16_split_x(b, rg));
@@ -1788,6 +1789,7 @@ static void encode_dirty_tiles(nir_builder *b, const struct texels *t, nir_def *
                                                         .image_dim = GLSL_SAMPLER_DIM_2D,
                                                         .image_array = true,
                                                         .format = PIPE_FORMAT_NONE,
+                                                        .access = ACCESS_COHERENT,
                                                         .dest_type = nir_type_uint32), 0);
    nir_def *x = nir_iadd(b, nir_ishl_imm(b, tx, STELA_METAL_DIRTY_TILE_SHIFT), lane);
    nir_def *y = nir_iadd(b, nir_ishl_imm(b, ty, STELA_METAL_DIRTY_TILE_SHIFT), row);
@@ -1821,6 +1823,7 @@ nir_shader *stela_metal_load_texels_kernel(const nir_shader_compiler_options *op
    nir_def *stored = nir_image_deref_load(&b, 4, 32, &t.image->def, t.coord, nir_undef(&b, 1, 32),
                                           nir_imm_int(&b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
                                           .image_array = true, .format = PIPE_FORMAT_NONE,
+                                          .access = ACCESS_COHERENT,
                                           .dest_type = nir_type_uint32);
    nir_def *rg = nir_channel(&b, stored, 0), *ba = nir_channel(&b, stored, 1);
    nir_push_if(&b, nir_ieq_imm(&b, t.encoding, STELA_METAL_TEXELS_ROTATED16));

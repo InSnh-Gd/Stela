@@ -29,26 +29,29 @@ pub mod query {
     const QUERY_CONFIG: u32 = 2;
     /// `DRM_XE_DEVICE_QUERY_MEM_REGIONS`.
     const QUERY_MEM_REGIONS: u32 = 1;
-    /// `struct drm_xe_query_config`: two 32-bit fields, then one 64-bit word
-    /// per parameter.
+    /// What `struct drm_xe_query_config` and `struct
+    /// drm_xe_query_mem_regions` hold before their arrays: their count, then
+    /// four bytes of alignment.
+    const COUNT: usize = 0;
+    /// The offset of `drm_xe_query_config`'s `info` array and of
+    /// `drm_xe_query_mem_regions`'s `mem_regions` array.
     const CONFIG_INFO: usize = 8;
     /// `DRM_XE_QUERY_CONFIG_REV_AND_DEVICE_ID`: the parameter whose word
     /// holds the device ID in its lower 16 bits.
     const CONFIG_REV_AND_DEVICE_ID: usize = 0;
-    /// How many parameters to make room for, past the five the header names.
-    const CONFIG_PARAMS: usize = 8;
-    /// `struct drm_xe_query_mem_regions`: its count, then its regions.
-    const MEM_REGIONS_COUNT: usize = 0;
     const MEM_REGIONS_FIRST: usize = 8;
-    /// How many regions to make room for: a device has one per memory class
-    /// and instance, and a VF's are its own.
-    const MEM_REGIONS: usize = 16;
     /// `struct drm_xe_mem_region`, and the two fields read from it.
     const MEM_REGION_BYTES: usize = 88;
     const MEM_REGION_CLASS: usize = 0;
     const MEM_REGION_TOTAL_SIZE: usize = 8;
     /// `DRM_XE_MEM_REGION_CLASS_VRAM` (`enum drm_xe_memory_class`).
     const MEM_REGION_CLASS_VRAM: u16 = 1;
+    /// The most bytes a reply may ask for. The driver answers a size of zero
+    /// with what it needs, and refuses any other size (`xe_query.c`), so the
+    /// reply is allocated from the driver's own answer: this bounds a reply
+    /// that answer cannot be trusted for. Memory regions are the largest
+    /// this reads, one per memory class and instance.
+    const MOST_BYTES: usize = 8 << 10;
 
     /// The little-endian `u64` at `offset`.
     fn word(reply: &[u8], offset: usize) -> u64 {
@@ -71,27 +74,41 @@ pub mod query {
         u16::from_le_bytes(bytes)
     }
 
-    /// Asks `query` for a reply of `bytes` and answers what the driver wrote,
-    /// or `None` when the call fails or asks for more room than that.
-    fn ask(control: Control, query: u32, bytes: usize) -> Option<Vec<u8>> {
-        let mut reply = vec![0u8; bytes];
+    /// Asks `query` for its reply and answers what the driver wrote, or `None`
+    /// when a call fails or asks for more room than [`MOST_BYTES`].
+    fn ask(control: Control, query: u32) -> Option<Vec<u8>> {
+        // The size the caller has room for is not a hint the driver trims to:
+        // it answers zero with the size it needs and refuses every other size
+        // that is not exactly that one, so the size is asked for first.
         let mut record = DeviceQuery {
             extensions: 0,
             query,
-            size: bytes as u32,
-            data: reply.as_mut_ptr() as u64,
+            size: 0,
+            data: 0,
             pad: [0; 2],
         };
         if control(DEVICE_QUERY, (&raw mut record).cast()) != 0 {
             return None;
         }
-        (record.size as usize <= bytes).then_some(reply)
+        let bytes = record.size as usize;
+        if bytes == 0 || bytes > MOST_BYTES {
+            return None;
+        }
+        let mut reply = vec![0u8; bytes];
+        record.data = reply.as_mut_ptr() as u64;
+        if control(DEVICE_QUERY, (&raw mut record).cast()) != 0 {
+            return None;
+        }
+        Some(reply)
     }
 
     /// `DRM_XE_QUERY_CONFIG_REV_AND_DEVICE_ID`: the PCI device ID xe bound,
     /// which is the chip identifier this stack reports.
     pub fn device_id(control: Control) -> Option<u32> {
-        let reply = ask(control, QUERY_CONFIG, CONFIG_INFO + CONFIG_PARAMS * 8)?;
+        let reply = ask(control, QUERY_CONFIG)?;
+        if half(&reply, COUNT) as usize <= CONFIG_REV_AND_DEVICE_ID {
+            return None;
+        }
         let id = word(&reply, CONFIG_INFO + CONFIG_REV_AND_DEVICE_ID * 8) & 0xffff;
         (id != 0).then_some(id as u32)
     }
@@ -99,10 +116,9 @@ pub mod query {
     /// The bytes of device memory the driver makes available: what its VRAM
     /// regions total, which on a VF is what the PF provisioned for it.
     pub fn memory_bytes(control: Control) -> Option<u64> {
-        let bytes = MEM_REGIONS_FIRST + MEM_REGIONS * MEM_REGION_BYTES;
-        let reply = ask(control, QUERY_MEM_REGIONS, bytes)?;
-        let count = half(&reply, MEM_REGIONS_COUNT) as usize;
-        if count == 0 || count > MEM_REGIONS {
+        let reply = ask(control, QUERY_MEM_REGIONS)?;
+        let count = half(&reply, COUNT) as usize;
+        if count == 0 || count > (reply.len() - MEM_REGIONS_FIRST) / MEM_REGION_BYTES {
             return None;
         }
         let mut total = 0u64;

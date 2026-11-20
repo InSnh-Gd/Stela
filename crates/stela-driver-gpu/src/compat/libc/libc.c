@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <link.h>
 #include <limits.h>
 #include <locale.h>
@@ -161,9 +162,13 @@ int atexit(void (*function)(void))
 	return 0;
 }
 
+/* ANV runs with CCS compression off: under the unified image layouts
+ * and host-side / copy-filled textures Stela's Metal device uses, Xe2+
+ * FlatCCS/CCS_E compression can leave sampled textures or blurs blank. */
 char *getenv(const char *name)
 {
-	(void)name;
+	if (name && !strcmp(name, "INTEL_DEBUG"))
+		return (char *)"noccs,no-resource-barrier,stall";
 	return NULL;
 }
 
@@ -467,6 +472,11 @@ lldiv_t lldiv(long long number, long long divisor)
 }
 
 long long llabs(long long value)
+{
+	return value < 0 ? -value : value;
+}
+
+intmax_t imaxabs(intmax_t value)
 {
 	return value < 0 ? -value : value;
 }
@@ -867,6 +877,14 @@ int open(const char *path, int flags, ...)
 	return checked(stela_libc_drm_open((unsigned int)strtoul(path + sizeof(prefix) - 1, NULL, 10)));
 }
 
+/* Each path is absolute, so Linux's "this process's directory" reads the same
+ * one as its own name would; `intel_measure` opens its control fifo this way. */
+int openat(int directory, const char *path, int flags, ...)
+{
+	(void)directory;
+	return open(path, flags);
+}
+
 int close(int fd)
 {
 	struct text_file *text = text_file(fd);
@@ -1013,6 +1031,16 @@ int mkdir(const char *path, mode_t mode)
 	return fail(EACCES);
 }
 
+/* `intel_measure` makes a fifo to steer itself with, when INTEL_MEASURE names
+ * one; there is no file to make it in, and nothing here sets that variable. */
+int mkfifoat(int directory, const char *path, mode_t mode)
+{
+	(void)directory;
+	(void)path;
+	(void)mode;
+	return fail(EACCES);
+}
+
 int access(const char *path, int mode)
 {
 	(void)path;
@@ -1070,12 +1098,25 @@ ssize_t write(int fd, const void *buffer, size_t size)
 	return (ssize_t)size;
 }
 
+/* The only caller is the import of a dma-buf, which seeks to its end for the
+ * size: the descriptor is Linux's, so the answer comes from there. The
+ * library's own files keep no position, and a driver's descriptor answers
+ * ESPIPE as Linux's would. */
 off_t lseek(int fd, off_t offset, int whence)
 {
-	(void)fd;
-	(void)offset;
-	(void)whence;
-	return fail(EBADF);
+	long result;
+
+	if (fd >= STELA_LIBC_FILE_BASE)
+		return fail(ESPIPE);
+	result = stela_libc_fd_seek(fd, offset, whence);
+	if (result < 0) {
+		fprintf(stderr, "lseek(%d, %lld, %d) refused: %d\n", fd, (long long)offset, whence,
+			(int)-result);
+		return fail((int)-result);
+	}
+	if (whence == SEEK_END && offset == 0)
+		fprintf(stderr, "dma-buf %d holds %ld bytes\n", fd, result);
+	return result;
 }
 
 int flock(int fd, int operation)

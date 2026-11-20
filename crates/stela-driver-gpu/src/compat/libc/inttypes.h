@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef STELA_LIBC_INTTYPES_H
 #define STELA_LIBC_INTTYPES_H
+#include <sys/cdefs.h>
 #include <stdint.h>
+__BEGIN_DECLS
+/* The Intel shader compiler takes a register's absolute value. */
+intmax_t imaxabs(intmax_t value);
+__END_DECLS
 #define PRId8 "d"
 #define PRId16 "d"
 #define PRId32 "d"

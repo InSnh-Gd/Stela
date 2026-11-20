@@ -33,12 +33,14 @@ __BEGIN_DECLS
 #define F_RDLCK 0
 #define F_WRLCK 1
 #define F_UNLCK 2
+#define AT_FDCWD -100
 struct flock {
 	short l_type, l_whence;
 	off_t l_start, l_len;
 	pid_t l_pid;
 };
 int open(const char *path, int flags, ...);
+int openat(int directory, const char *path, int flags, ...);
 int fcntl(int fd, int command, ...);
 __END_DECLS
 #endif

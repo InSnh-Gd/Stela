@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* libdrm, as far as NVK reaches it: thin wrappers of DRM's ioctls, with the
- * entry points of xf86drm.h. Devices come from the host, not from /sys. */
+/* libdrm, as far as NVK and ANV reach it: thin wrappers of DRM's ioctls, with
+ * the entry points of xf86drm.h. Devices come from the host, not from /sys. */
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -69,8 +69,11 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
 	struct drm_prime_handle prime = {.fd = prime_fd};
 	int result = drmIoctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime);
-	if (result)
+	if (result) {
+		fprintf(stderr, "PRIME_FD_TO_HANDLE of dma-buf %d on %d refused: %d\n", prime_fd, fd,
+			errno);
 		return result;
+	}
 	*handle = prime.handle;
 	return 0;
 }
@@ -123,6 +126,7 @@ struct device_block {
 	char *nodes[DRM_NODE_MAX];
 	drmPciBusInfo bus;
 	drmPciDeviceInfo info;
+	char primary[32];
 	char render[32];
 };
 
@@ -133,6 +137,14 @@ static drmDevicePtr device_at(unsigned int index)
 	if (!block)
 		return NULL;
 	stela_libc_drm_device(index, &host);
+	/* Both of the device's nodes are named, as libdrm names the ones a
+	 * device has: ANV opens and stats the primary node without asking
+	 * whether the device has one (`anv_physical_device_try_create`), and
+	 * reads a NULL there as a path. The guest's `open` answers the primary
+	 * node with ENOENT, so the extension that needs a master file
+	 * descriptor is unavailable, as it is for a device with no outputs. */
+	snprintf(block->primary, sizeof(block->primary), DRM_DIR_NAME "/card%u", index);
+	block->nodes[DRM_NODE_PRIMARY] = block->primary;
 	snprintf(block->render, sizeof(block->render), DRM_DIR_NAME "/renderD%u",
 		 RENDER_MINOR + index);
 	block->nodes[DRM_NODE_RENDER] = block->render;
@@ -151,7 +163,7 @@ static drmDevicePtr device_at(unsigned int index)
 	};
 	block->device = (drmDevice){
 		.nodes = block->nodes,
-		.available_nodes = 1 << DRM_NODE_RENDER,
+		.available_nodes = (1 << DRM_NODE_PRIMARY) | (1 << DRM_NODE_RENDER),
 		.bustype = DRM_BUS_PCI,
 		.businfo.pci = &block->bus,
 		.deviceinfo.pci = &block->info,

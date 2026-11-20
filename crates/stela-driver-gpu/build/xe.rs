@@ -161,7 +161,6 @@ const OPEN: &[(&str, &[&str])] = &[
             "vmf_insert_pfn",
             "anon_inode_getfd",
             "get_cmdline",
-            "synchronize_irq",
             "pci_assign_unassigned_bus_resources",
         ],
     ),

@@ -26,6 +26,7 @@ int *__errno_location(void);
 #define EMFILE 24
 #define ENOTTY 25
 #define ENOSPC 28
+#define ESPIPE 29
 #define ERANGE 34
 #define EDEADLK 35
 #define ENOSYS 38
@@ -33,6 +34,7 @@ int *__errno_location(void);
 #define EOPNOTSUPP 95
 #define ENOTSUP EOPNOTSUPP
 #define ETIME 62
+#define ENOBUFS 105
 #define ETIMEDOUT 110
 #define ECANCELED 125
 __END_DECLS

@@ -4583,7 +4583,8 @@ mark_dirty_tiles(struct translator *t)
       nir_image_deref_store(b, &attachment_image(t, n)->def, coord, nir_imm_int(b, 0),
                             nir_vec4(b, stamp, nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 0)),
                             nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = true,
-                            .format = PIPE_FORMAT_NONE, .src_type = nir_type_uint32);
+                            .format = PIPE_FORMAT_NONE, .access = ACCESS_COHERENT,
+                            .src_type = nir_type_uint32);
       nir_pop_if(b, NULL);
    }
    nir_pop_if(b, NULL);

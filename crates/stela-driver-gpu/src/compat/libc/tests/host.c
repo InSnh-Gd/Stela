@@ -189,6 +189,14 @@ int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument)
 	return -ENODEV;
 }
 
+long stela_libc_fd_seek(int fd, long long offset, int whence)
+{
+	(void)fd;
+	(void)offset;
+	(void)whence;
+	return -ENODEV;
+}
+
 void *stela_libc_drm_mmap(int fd, uint64_t offset, size_t size)
 {
 	(void)fd;

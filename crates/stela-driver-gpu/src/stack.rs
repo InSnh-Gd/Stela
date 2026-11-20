@@ -73,12 +73,8 @@ pub static NVIDIA: GpuStack = GpuStack {
 };
 
 /// Intel's integrated GPUs: the xe kernel driver over its GuC and HuC
-/// firmware, for the Xe3P parts Stela drives (`build/xe.rs`).
-///
-/// The Metal device this stack gives macOS is the xe port's own Vulkan
-/// driver, which the image does not carry yet: [`crate::metal::intel`]
-/// admits nothing, so a boot that claimed an Intel GPU stops with the reason
-/// rather than starting a guest whose WindowServer has no device.
+/// firmware, for the Xe3P parts Stela drives (`build/xe.rs`), with ANV for
+/// the Metal device macOS asks for.
 #[cfg(feature = "xe-port")]
 pub static INTEL: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -94,7 +90,7 @@ pub static INTEL: GpuStack = GpuStack {
     #[cfg(feature = "metal")]
     metal: crate::metal::intel::ADMISSION,
     #[cfg(all(feature = "metal-linked", not(test)))]
-    vulkan: None,
+    vulkan: Some(crate::metal::intel::DRIVER),
 };
 
 /// Brings Linux up and registers every kernel driver built into the image,
@@ -222,37 +218,60 @@ mod tests {
     fn xe_queries_ask_its_device_query_and_keep_refusals() {
         let mut asked = alloc::vec::Vec::new();
         let mut answer = |request: u32, argument: *mut c_void| {
-            // SAFETY: both queries pass their own `struct drm_xe_device_query`,
-            // whose `data` points at the buffer its caller allocated.
+            // SAFETY: both queries pass their own `struct drm_xe_device_query`.
             let record = unsafe { &mut *argument.cast::<[u64; 4]>() };
             // The query is the record's first 32-bit field, its size the
             // second.
             let query = record[1] as u32;
             let bytes = (record[1] >> 32) as usize;
             asked.push((request, query));
-            // SAFETY: the caller allocated `bytes` for this reply.
-            let reply = unsafe { core::slice::from_raw_parts_mut(record[2] as *mut u8, bytes) };
-            match query {
-                // `DRM_XE_DEVICE_QUERY_CONFIG`: one parameter, the device ID
-                // and revision.
-                2 => {
-                    reply[..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-                    reply[8..16].copy_from_slice(&0x0000_0000_0000_b080u64.to_le_bytes());
-                }
+            // What the driver answers: the bytes its reply needs, and how to
+            // fill that many when they are asked for.
+            let (needed, fill): (usize, fn(&mut [u8])) = match query {
+                // `DRM_XE_DEVICE_QUERY_CONFIG`: five parameters, whose first
+                // holds the device ID and revision.
+                2 => (
+                    8 + 5 * 8,
+                    |reply| {
+                        reply[..4].copy_from_slice(&5u32.to_le_bytes());
+                        reply[8..16].copy_from_slice(&0x0000_0000_0000_b080u64.to_le_bytes());
+                    },
+                ),
                 // `DRM_XE_DEVICE_QUERY_MEM_REGIONS`: one VRAM region of
                 // 3072 MiB, whose `total_size` lies past its two halves.
-                1 => {
-                    reply[..4].copy_from_slice(&1u32.to_le_bytes());
-                    reply[8..10].copy_from_slice(&1u16.to_le_bytes());
-                    reply[16..24].copy_from_slice(&(3072u64 << 20).to_le_bytes());
-                }
+                1 => (
+                    8 + 88,
+                    |reply| {
+                        reply[..4].copy_from_slice(&1u32.to_le_bytes());
+                        reply[8..10].copy_from_slice(&1u16.to_le_bytes());
+                        reply[16..24].copy_from_slice(&(3072u64 << 20).to_le_bytes());
+                    },
+                ),
                 other => panic!("unexpected query {other}"),
+            };
+            // The driver refuses a size of its own reply that is not exactly
+            // what it needs, and answers a size of zero with that one.
+            if bytes == 0 {
+                record[1] |= (needed as u64) << 32;
+                return 0;
             }
+            assert_eq!(bytes, needed, "a reply is asked for at its own size");
+            // SAFETY: the caller allocated `bytes` for this reply.
+            let reply = unsafe { core::slice::from_raw_parts_mut(record[2] as *mut u8, bytes) };
+            fill(reply);
             0
         };
         assert_eq!((INTEL.kernel.chip)(&mut answer), Some(0xb080));
         assert_eq!((INTEL.kernel.memory_bytes)(&mut answer), Some(3072 << 20));
-        assert_eq!(asked, [(0xc020_6440, 2), (0xc020_6440, 1)]);
+        assert_eq!(
+            asked,
+            [
+                (0xc020_6440, 2),
+                (0xc020_6440, 2),
+                (0xc020_6440, 1),
+                (0xc020_6440, 1)
+            ]
+        );
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!((INTEL.kernel.chip)(&mut refuse), None);
         assert_eq!((INTEL.kernel.memory_bytes)(&mut refuse), None);

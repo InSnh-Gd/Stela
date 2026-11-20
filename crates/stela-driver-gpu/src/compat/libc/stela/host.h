@@ -45,6 +45,9 @@ int stela_libc_drm_dup(int fd);
 long stela_libc_drm_rdev(int fd);
 /* `argument` is in-process. */
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument);
+/* The descriptor's position, as lseek would, or a negative errno. A dma-buf
+ * answers its size for SEEK_END, which is how an importer learns it. */
+long stela_libc_fd_seek(int fd, long long offset, int whence);
 /* A pointer, or a negative errno. Every page is mapped on return. */
 void *stela_libc_drm_mmap(int fd, uint64_t offset, size_t size);
 /* 0: not a DRM mapping; +1: DRM unmap completed; negative errno: recognized
