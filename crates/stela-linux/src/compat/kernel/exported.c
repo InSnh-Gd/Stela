@@ -106,6 +106,10 @@ int stela_linux_export(const struct stela_linux_run *runs, size_t count)
 		kfree(memory);
 		return (int)PTR_ERR(buffer);
 	}
+	/* An importer learns the buffer's size by seeking to its end: the
+	 * buffer's file carries that llseek, and the flag is what the seek path
+	 * tests for, so the exporter sets it. */
+	buffer->file->f_mode |= FMODE_LSEEK;
 	/* The buffer's release frees the memory from here on. */
 	fd = dma_buf_fd(buffer, O_CLOEXEC);
 	if (fd < 0)

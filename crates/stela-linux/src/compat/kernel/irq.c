@@ -277,6 +277,29 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	return name;
 }
 
+/* Wait for a line's primary callbacks to have ended, as Linux does before a
+ * driver's teardown stops touching its device.
+ *
+ * The callbacks of every line run on the one service CPU, inside the host
+ * drivers' lock that every Linux entry holds ([`stela_linux_irq_run`],
+ * [`free_irq_locked`] and the engine's own IRQ joining rely on that
+ * serialization). A callback that had begun has ended before this caller
+ * runs, and one the service has not taken yet has run nothing: there is
+ * nothing to wait for, and no callback can begin here. The caller disables
+ * the line and resets the device next, as xe's `xe_irq_reset` does, which is
+ * what keeps later raises from finding a handler.
+ *
+ * A line nobody requested is named: Linux's synchronize_irq prints that its
+ * actions are gone, and a driver that synchronizes a line it never requested
+ * has a bug of its own. */
+void synchronize_irq(unsigned int irq)
+{
+	if (in_interrupt())
+		stela_linux_fatal("synchronize_irq in interrupt context");
+	if (!line_owner(irq, false))
+		WARN(1, "synchronize_irq of unrequested IRQ %u\n", irq);
+}
+
 void stela_linux_irq_run(unsigned int irq)
 {
 	struct stela_linux_atomic_callback scope;

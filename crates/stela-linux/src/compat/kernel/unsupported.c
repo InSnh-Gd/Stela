@@ -5,11 +5,25 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/platform_device.h>
+#include <linux/printk.h>
 #include <linux/rcupdate.h>
 #include <linux/seq_file.h>
 #include <linux/swap.h>
 #include <stela/linux.h>
 #include <unsupported.h>
+
+/* Names the missing function in the log, the one thing the engine's report of
+ * the trap cannot say, then stops. The message goes out before the trap so a
+ * stop inside the host drivers still carries it; the first report wins, since
+ * reaching this again would come from the reporting itself. */
+__attribute__((noreturn)) void stela_unsupported(const char *name)
+{
+	static int reported;
+
+	if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL) == 0)
+		pr_err("stela: unsupported: %s\n", name);
+	__builtin_trap();
+}
 
 /* Pages behind shmem files and shmem-backed GEM objects, which swap and
  * nouveau's TTM objects never need: TTM allocates pages from its own pool and
@@ -80,11 +94,6 @@ STELA_UNSUPPORTED(vm_fault_t, vmf_insert_pfn, struct vm_area_struct *, unsigned 
 		  unsigned long)
 STELA_UNSUPPORTED(int, anon_inode_getfd, const char *, const struct file_operations *, void *,
 		  int)
-
-/* An interrupt that is in service. Stela's owner delivers a line in one
- * context and never reports a handler still in flight, so there is nothing to
- * wait for and no honest answer to give a driver that resets a device. */
-STELA_UNSUPPORTED(void, synchronize_irq, unsigned int)
 
 /* Another task's argument vector, which lives in an address space Stela does
  * not walk. Only lib/string_helpers.c's quotable command line asks for it, and

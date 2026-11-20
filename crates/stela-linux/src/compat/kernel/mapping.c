@@ -11,6 +11,7 @@
 #include <linux/interval_tree_generic.h>
 #include <linux/mm.h>
 #include <linux/pagemap.h>
+#include <linux/printk.h>
 #include <linux/rmap.h>
 #include <linux/slab.h>
 #include <stela/file.h>
@@ -52,6 +53,28 @@ INTERVAL_TREE_DEFINE(struct vm_area_struct, shared.rb, unsigned long, shared.rb_
 static struct mm_struct client_mm = {
 	.mmap_lock = __RWSEM_INITIALIZER(client_mm.mmap_lock),
 };
+
+/* Why a client fault or a window fill put no page back. The first ones are
+ * reported whole, then each power of two after them: a mapping whose fill
+ * fails once fails on every window, and the reason matters more than the
+ * count. */
+static void report_fault(const struct stela_linux_mapping *mapping, unsigned long address,
+			 bool write, vm_fault_t result, const char *why)
+{
+	static unsigned long reported;
+	unsigned long count = ++reported;
+
+	if (count > 32 && count & (count - 1))
+		return;
+	const struct vm_area_struct *vma = &mapping->vma;
+
+	pr_err("stela: fault %#lx (write=%d) in the mapping %#lx-%#lx pgoff=%lu failed: %s "
+	       "-> %#x%s%s%s%s (count %lu)\n",
+	       address, write, vma->vm_start, vma->vm_end, vma->vm_pgoff, why, (unsigned int)result,
+	       result & VM_FAULT_OOM ? " OOM" : "", result & VM_FAULT_SIGBUS ? " SIGBUS" : "",
+	       result & VM_FAULT_SIGSEGV ? " SIGSEGV" : "", result & VM_FAULT_RETRY ? " RETRY" : "",
+	       count);
+}
 
 /* The write-back protection a VMA's page table entries start from. */
 pgprot_t vm_get_page_prot(vm_flags_t vm_flags)
@@ -296,6 +319,18 @@ void stela_linux_munmap(struct stela_linux_mapping *mapping)
 	kfree(mapping);
 }
 
+bool stela_linux_unmap_pages(struct stela_linux_mapping *mapping, unsigned long address,
+			     size_t size)
+{
+	struct vm_area_struct *vma = &mapping->vma;
+
+	if (!size || !PAGE_ALIGNED(address) || !PAGE_ALIGNED(size) || address < vma->vm_start ||
+	    size > vma->vm_end - address)
+		return false;
+	unmap_client(mapping, address, size);
+	return true;
+}
+
 static vm_fault_t install_file_page(struct stela_linux_mapping *mapping, struct vm_fault *vmf,
 				    vm_fault_t result, unsigned long sequence, bool write)
 {
@@ -389,8 +424,13 @@ vm_fault_t stela_linux_fault(struct stela_linux_mapping *mapping, unsigned long 
 	struct vm_area_struct *vma = &mapping->vma;
 
 	if (address < vma->vm_start || address >= vma->vm_end ||
-	    (write && !(vma->vm_flags & VM_WRITE)) || !vma->vm_ops || !vma->vm_ops->fault)
+	    (write && !(vma->vm_flags & VM_WRITE)) || !vma->vm_ops || !vma->vm_ops->fault) {
+		report_fault(mapping, address, write, VM_FAULT_SIGSEGV,
+			     address < vma->vm_start || address >= vma->vm_end ? "outside the vma" :
+			     (write && !(vma->vm_flags & VM_WRITE)) ? "a write to a read-only vma" :
+								      "no fault operation");
 		return VM_FAULT_SIGSEGV;
+	}
 	address &= PAGE_MASK;
 	struct vm_fault vmf = {
 		.vma = vma,
@@ -403,11 +443,22 @@ vm_fault_t stela_linux_fault(struct stela_linux_mapping *mapping, unsigned long 
 	unsigned long sequence = READ_ONCE(mapping->invalidate_sequence);
 	vm_fault_t result = vma->vm_ops->fault(&vmf);
 
-	if (result & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY | VM_FAULT_COMPLETED))
+	if (result & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY | VM_FAULT_COMPLETED)) {
+		if (!(result & VM_FAULT_NOPAGE) ||
+		    result & (VM_FAULT_ERROR | VM_FAULT_RETRY | VM_FAULT_COMPLETED))
+			report_fault(mapping, address, write, result, "the file's own fault");
 		return result;
-	if (!vmf.page)
+	}
+	if (!vmf.page) {
+		report_fault(mapping, address, write, VM_FAULT_SIGBUS,
+			     "the file's fault installed nothing and returned no page");
 		return VM_FAULT_SIGBUS;
-	return install_file_page(mapping, &vmf, result, sequence, write);
+	}
+	vm_fault_t installed = install_file_page(mapping, &vmf, result, sequence, write);
+
+	if (!(installed & VM_FAULT_NOPAGE) || installed & (VM_FAULT_ERROR | VM_FAULT_RETRY))
+		report_fault(mapping, address, write, installed, "installing the file's page");
+	return installed;
 }
 
 bool stela_linux_refault(struct stela_linux_mapping *mapping, unsigned long address, bool write)
@@ -428,8 +479,16 @@ vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, u
 	int error = owner->services->map_user(owner->context, mapping->space, addr, pfn,
 					      pgprot_val(pgprot));
 
-	if (error)
+	if (error) {
+		static unsigned long reported;
+		unsigned long count = ++reported;
+
+		if (count <= 32 || !(count & (count - 1)))
+			pr_err("stela: mapping %#lx-%#lx page %#lx (pfn %#lx) was not mapped: "
+			       "%d (count %lu)\n",
+			       vma->vm_start, vma->vm_end, addr, pfn, error, count);
 		return error == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+	}
 	mapping->filled = max(mapping->filled, (addr & PAGE_MASK) + PAGE_SIZE);
 	return VM_FAULT_NOPAGE;
 }
@@ -696,6 +755,19 @@ int main(void)
 	assert(stela_linux_mmap(file, SPACE, BASE, PAGE_SIZE, 0, true, &mapping) == -EPERM);
 	mmap_error = 0;
 	assert(!stela_linux_mmap(file, SPACE, BASE, 4 * PAGE_SIZE, 3 * PAGE_SIZE, false, &mapping));
+
+	/* A client's munmap may cover part of one mapping: a driver that
+	 * over-maps to place a buffer at an offset then releases the prefix it
+	 * does not use, and the rest of the mapping stays. */
+	assert(!stela_linux_unmap_pages(mapping, BASE + 1, PAGE_SIZE));
+	assert(!stela_linux_unmap_pages(mapping, BASE, 4 * PAGE_SIZE + PAGE_SIZE));
+	assert(!stela_linux_unmap_pages(mapping, BASE, 0));
+	assert(!stela_linux_unmap_pages(mapping, BASE - PAGE_SIZE, PAGE_SIZE));
+	assert(stela_linux_unmap_pages(mapping, BASE, PAGE_SIZE));
+	assert(removed_address == BASE && removed_size == PAGE_SIZE);
+	assert(stela_linux_unmap_pages(mapping, BASE + 3 * PAGE_SIZE, 2 * PAGE_SIZE));
+	assert(removed_address == BASE + 3 * PAGE_SIZE && removed_size == PAGE_SIZE);
+	assert(stela_linux_refault(mapping, BASE + PAGE_SIZE, false));
 
 	/* A read fault at page 1 of the mapping is page 4 of the file. */
 	assert(stela_linux_fault(mapping, BASE + 4 * PAGE_SIZE, false) == VM_FAULT_SIGSEGV);

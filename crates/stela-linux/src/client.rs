@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn stela_linux_fd_close(fd: c_int);
     fn stela_linux_fd_dup(fd: c_int) -> c_int;
     fn stela_linux_fd_device(fd: c_int) -> c_long;
+    fn stela_linux_fd_seek(fd: c_int, offset: i64, whence: c_int) -> c_long;
     fn stela_linux_ioctl(fd: c_int, request: c_uint, argument: *mut c_void) -> c_long;
     fn stela_linux_map(
         fd: c_int,
@@ -39,6 +40,7 @@ unsafe extern "C" {
         mapping: *mut *mut c_void,
     ) -> c_int;
     fn stela_linux_munmap(mapping: *mut c_void);
+    fn stela_linux_unmap_pages(mapping: *mut c_void, address: u64, size: usize) -> bool;
     fn stela_linux_fill_around(mapping: *mut c_void, address: u64, write: bool) -> bool;
     fn stela_linux_wait(word: *const c_uint, value: c_uint, nanoseconds: u64);
     fn stela_linux_wake();
@@ -105,6 +107,16 @@ pub unsafe fn device(fd: c_int) -> i64 {
     unsafe { stela_linux_fd_device(fd) }
 }
 
+/// The descriptor's position, as lseek would, or a negative errno. A dma-buf
+/// answers its size for SEEK_END, which is how an importer learns it.
+///
+/// # Safety
+/// See the module.
+pub unsafe fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
+    // SAFETY: the module's contract and this function's.
+    unsafe { stela_linux_fd_seek(fd, offset, whence) }
+}
+
 /// # Safety
 /// See the module. `argument` is what `request` says it is.
 pub unsafe fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
@@ -137,6 +149,18 @@ pub unsafe fn map(fd: c_int, address: u64, size: usize, offset: u64) -> Result<M
 pub unsafe fn unmap(mapping: Mapping) {
     // SAFETY: the module's contract and this function's.
     unsafe { stela_linux_munmap(mapping.0) };
+}
+
+/// Take the pages `[address, address + size)` out of `mapping`, keeping the
+/// rest mapped: a client's `munmap` may cover part of one mapping. Whether
+/// the range was inside it.
+///
+/// # Safety
+/// See the module. `mapping` stays live, and no fault is outstanding on the
+/// range when this returns.
+pub unsafe fn unmap_pages(mapping: Mapping, address: u64, size: usize) -> bool {
+    // SAFETY: the module's contract and this function's.
+    unsafe { stela_linux_unmap_pages(mapping.0, address, size) }
 }
 
 /// Install the page at `address`, on the client's first touch or after

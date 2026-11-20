@@ -248,6 +248,23 @@ long stela_linux_fd_device(int fd)
 	return device;
 }
 
+/* A descriptor's position, as lseek would: a dma-buf answers its size for
+ * SEEK_END, which is how an importer learns it. */
+long stela_linux_fd_seek(int fd, long long offset, int whence)
+{
+	struct file *file = fget((unsigned int)fd);
+
+	if (!file)
+		return -EBADF;
+	long result = vfs_llseek(file, offset, whence);
+
+	if (result == -ESPIPE)
+		pr_info("stela: descriptor %d cannot seek (mode %#x, llseek %s)\n", fd, file->f_mode,
+			file->f_op->llseek ? "set" : "none");
+	fput(file);
+	return result;
+}
+
 static DECLARE_WAIT_QUEUE_HEAD(stela_linux_waiters);
 
 void stela_linux_wait(const volatile unsigned int *word, unsigned int value, u64 nanoseconds)

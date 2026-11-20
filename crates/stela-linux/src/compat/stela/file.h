@@ -31,6 +31,9 @@ int stela_linux_open(dev_t device, unsigned int flags);
 int stela_linux_fd_dup(int fd);
 long stela_linux_fd_device(int fd);
 long stela_linux_ioctl(int fd, unsigned int request, void *argument);
+/* The descriptor's position, as lseek would, or a negative errno. A dma-buf
+ * answers its size for SEEK_END, which is how an importer learns it. */
+long stela_linux_fd_seek(int fd, long long offset, int whence);
 /* Sleep while *word holds value, for at most `nanoseconds` (U64_MAX: no limit).
  * A client's thread is a Linux task, whose lock holders can run only if it does. */
 void stela_linux_wait(const volatile unsigned int *word, unsigned int value, u64 nanoseconds);
@@ -67,6 +70,13 @@ void stela_linux_munmap(struct stela_linux_mapping *mapping);
  * at a time (stela_linux_fill_around). */
 int stela_linux_map(int fd, void *space, unsigned long address, size_t size, u64 offset,
 		    struct stela_linux_mapping **mapping);
+
+/* Takes the pages [address, address + size) out of a mapping its client keeps
+ * the rest of: Linux's munmap may cover part of one mapping, as a driver that
+ * over-maps to place a buffer at an offset then releases its prefix. False
+ * when the range is not inside the mapping. */
+bool stela_linux_unmap_pages(struct stela_linux_mapping *mapping, unsigned long address,
+			     size_t size);
 
 /* Serves a client's first touch of, or return to, the page at address:
  * faults it back, then fills the rest of its STELA_LINUX_FILL_BYTES window.
