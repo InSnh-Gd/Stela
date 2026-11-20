@@ -1,6 +1,30 @@
 //! First failed ordinary allocation: no allocation, waiting or caller formatter.
 use super::{CLASSES, CPUS, Heap, Usage};
-use core::{alloc::Layout, fmt, sync::atomic::Ordering};
+use core::{
+    alloc::Layout,
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+/// Called once, after the first failed allocation's report reached the sink:
+/// the boot names the blocks the heap held then. The heap has just refused
+/// an allocation, so the hook keeps its own work small yet may allocate: the
+/// one-shot guard already claimed this failure.
+static FAILURE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the hook [`FAILURE_HOOK`] calls.
+pub fn set_failure_hook(hook: fn()) {
+    FAILURE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn failure_reported() {
+    let hook = FAILURE_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_failure_hook` stores a nonzero value, a `fn()`.
+        let hook: fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
+}
 
 struct Report {
     layout: Layout,
@@ -157,6 +181,9 @@ pub(super) fn report(heap: &Heap, layout: Layout) {
         // This formatter emits only fixed strings and integer fields; the
         // sink is bounded, lock-free output that runs no queue or log.
         (heap.failure_sink)(format_args!("\n{report}\n"));
+        // Outside the lock `capture` took and released, and after the
+        // report, so the hook's own lines follow the numbers they name.
+        failure_reported();
     }
 }
 

@@ -37,7 +37,7 @@ use core::{
 // Explicit, so the NVIDIA LUT fixture can compile this file by path.
 #[path = "heap/failure.rs"]
 mod failure;
-pub use failure::{FailedHeap, Failure};
+pub use failure::{FailedHeap, Failure, set_failure_hook};
 #[path = "heap/tally.rs"]
 pub mod tally;
 

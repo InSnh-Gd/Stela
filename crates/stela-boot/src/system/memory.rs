@@ -131,7 +131,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         },
     };
     let free = free_ram()?;
-    let sizes = stela_boot_core::host_memory::sizes(free, cores, cores)?;
+    let sizes = stela_boot_core::host_memory::sizes_aiming(free, cores, cores, HEAP_AIM)?;
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M\n",
         free >> 20,

@@ -92,8 +92,8 @@ fn a_host_short_of_the_larger_window_falls_back_to_the_smaller() {
         .step_by(16)
         .map(|free| free * MIB)
         .find(|&free| {
-            let large = estimate_with(free, 2, 2, WINDOW_PER_RUNNER).unwrap();
-            let small = estimate_with(free, 2, 2, SMALL_WINDOW_PER_RUNNER).unwrap();
+            let large = estimate_with(free, 2, 2, WINDOW_PER_RUNNER, HEAP_TARGET).unwrap();
+            let small = estimate_with(free, 2, 2, SMALL_WINDOW_PER_RUNNER, HEAP_TARGET).unwrap();
             large.guest < GUEST_FLOOR && small.guest >= GUEST_FLOOR
         })
         .expect("a host the fallback lets boot");

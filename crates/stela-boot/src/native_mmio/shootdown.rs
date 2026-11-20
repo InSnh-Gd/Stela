@@ -50,7 +50,7 @@ const NMI_MICROS: u64 = 250;
 const WAIT_MS: u64 = 30_000;
 const CR4_PGE: u64 = 1 << 7;
 const CR4_PCIDE: u64 = 1 << 17;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal")]
 const RFLAGS_IF: u64 = 1 << 9;
 const PAGE: u64 = 4096;
 /// CPUID.(EAX=7,ECX=0):EBX.INVPCID.
@@ -347,7 +347,7 @@ impl Drop for Restore {
 /// # Safety
 /// The caller holds nothing those two handlers take, and the job leaves
 /// RFLAGS.IF and CR8 as it found them.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal")]
 pub(crate) unsafe fn job<R>(body: impl FnOnce() -> R) -> R {
     let flags: u64;
     // SAFETY: reads RFLAGS through the stack, which the push and pop balance.
@@ -381,7 +381,7 @@ pub(crate) unsafe fn job<R>(body: impl FnOnce() -> R) -> R {
 
 /// Whether [`job`] here runs its body with interrupts on: they are on, or
 /// the task priority is no higher than the one it raises.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal")]
 pub(crate) fn job_opens() -> bool {
     let flags: u64;
     // SAFETY: reads RFLAGS through the stack, which the push and pop balance.
@@ -576,7 +576,7 @@ impl Drop for Counted {
 /// late processors, and the NMIs gates claimed as owed: a retirement's
 /// whose mark another gate took, and a counter's already reloaded
 /// ([`gate`]), for the GPU gate's report.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal")]
 pub(crate) fn take_waits() -> (u64, u64, u64, u64, [u64; 2]) {
     (
         WAITS[0].swap(0, Ordering::Relaxed),
@@ -591,7 +591,7 @@ pub(crate) fn take_waits() -> (u64, u64, u64, u64, [u64; 2]) {
 
 /// The shootdowns since [`take_waits`] last cleared them, left counting: a
 /// caller takes the difference across its own work.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal")]
 pub(crate) fn count() -> u64 {
     WAITS[0].load(Ordering::Relaxed)
 }

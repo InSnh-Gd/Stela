@@ -44,6 +44,46 @@ static CALLS: AtomicU64 = AtomicU64::new(0);
 /// Lets the heap tell this module of its large blocks.
 pub(super) fn install() {
     stela_boot_core::heap::set_large_hook(allocated_or_freed);
+    stela_boot_core::heap::set_failure_hook(report_live);
+}
+
+/// The heap's first failed allocation: print every live large block and its
+/// allocating stack at once. The boot stops on most such failures, and the
+/// next heartbeat's [`report`] never comes; this one runs where the heap
+/// just refused an allocation, so it allocates nothing and prints in the
+/// slots' order rather than by size.
+fn report_live() {
+    let mut blocks = 0u64;
+    let mut bytes = 0u64;
+    for slot in BLOCKS.iter() {
+        if slot.pointer.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        blocks += 1;
+        bytes += slot.bytes.load(Ordering::Acquire);
+    }
+    output::arguments(format_args!(
+        "HEAP LARGE AT FAILURE blocks={blocks} bytes={}M untracked={} empty_stacks={}\n",
+        bytes >> 20,
+        UNTRACKED.load(Ordering::Relaxed),
+        EMPTY.load(Ordering::Relaxed)
+    ));
+    for slot in BLOCKS.iter() {
+        if slot.pointer.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        output::arguments(format_args!(
+            "HEAP LARGE {}M stack",
+            slot.bytes.load(Ordering::Acquire) >> 20
+        ));
+        for word in slot.words.iter() {
+            let offset = word.load(Ordering::Relaxed);
+            if offset != 0 {
+                output::arguments(format_args!(" {offset:#x}"));
+            }
+        }
+        output::arguments(format_args!("\n"));
+    }
 }
 
 /// The heap's large-block hook. It runs on any processor, outside the

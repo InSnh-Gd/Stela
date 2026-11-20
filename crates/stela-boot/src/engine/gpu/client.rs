@@ -30,7 +30,8 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    cell::{Cell, RefCell},
+    arch::asm,
+    cell::{Cell, RefCell, UnsafeCell},
     ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void},
     hint,
     pin::Pin,
@@ -114,6 +115,13 @@ enum Operation {
     Close(c_int),
     Duplicate(c_int),
     Device(c_int),
+    /// The descriptor's position, as lseek would: an import of a dma-buf
+    /// seeks to its end for the size.
+    Seek {
+        fd: c_int,
+        offset: i64,
+        whence: c_int,
+    },
     Control {
         fd: c_int,
         request: u32,
@@ -124,7 +132,12 @@ enum Operation {
         offset: u64,
         size: usize,
     },
-    Unmap(u64),
+    /// The bytes a client unmaps: Linux's `munmap` may cover part of one
+    /// mapping, which the rest of stays mapped.
+    Unmap {
+        address: u64,
+        size: usize,
+    },
     Fault {
         address: u64,
         write: bool,
@@ -373,11 +386,24 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
             Operation::Close(fd) => client::close(fd).into(),
             Operation::Duplicate(fd) => client::duplicate(fd).into(),
             Operation::Device(fd) => client::device(fd),
+            Operation::Seek {
+                fd,
+                offset,
+                whence,
+            } => client::seek(fd, offset, whence),
             Operation::Control {
                 fd,
                 request,
                 argument,
-            } => client::control(fd, request, argument),
+            } => {
+                let result = client::control(fd, request, argument);
+                if result < 0 {
+                    output::arguments(format_args!(
+                        "ioctl {request:#x} on descriptor {fd} refused: {result}\n"
+                    ));
+                }
+                result
+            }
             Operation::Map { fd, offset, size } => {
                 let pages = size / PAGE as usize;
                 let Some(address) = gpu.window.reserve(pages) else {
@@ -387,6 +413,13 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     Ok(mapping) => {
                         gpu.mappings.borrow_mut().insert(address, (mapping, pages));
                         MAPPINGS.fetch_add(1, Ordering::Relaxed);
+                        record_event(Event {
+                            kind: Event::MAP,
+                            address,
+                            size: size as u64,
+                            other: fd as u64,
+                            extra: offset,
+                        });
                         address as i64
                     }
                     Err(error) => {
@@ -395,15 +428,49 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     }
                 }
             }
-            Operation::Unmap(address) => {
-                let Some((mapping, pages)) = gpu.mappings.borrow_mut().remove(&address) else {
+            Operation::Unmap { address, size } => {
+                let mappings = gpu.mappings.borrow();
+                let Some((&start, &(mapping, pages))) = mappings.range(..=address).next_back()
+                else {
+                    output::arguments(format_args!(
+                        "GPU unmap {address:#x} of {size:#x} bytes: no client mapping at or \
+                         below it\n"
+                    ));
                     return EFAULT;
                 };
-                client::unmap(mapping);
-                MAPPINGS.fetch_sub(1, Ordering::Relaxed);
-                // A processor that kept the translation keeps the addresses too.
-                if gpu.window.remove(address, pages) {
-                    gpu.window.release(address, pages);
+                let end = start + pages as u64 * PAGE;
+                let last = end.min(address.saturating_add(size as u64));
+                if last <= address {
+                    output::arguments(format_args!(
+                        "GPU unmap {address:#x} of {size:#x} bytes: past the mapping at \
+                         {start:#x} ({pages} pages, ends {end:#x})\n"
+                    ));
+                    return EFAULT;
+                }
+                let whole = address == start && last == end;
+                record_event(Event {
+                    kind: Event::UNMAP,
+                    address,
+                    size: last - address,
+                    other: pages as u64,
+                    extra: u64::from(whole),
+                });
+                drop(mappings);
+                if whole {
+                    gpu.mappings.borrow_mut().remove(&start);
+                    MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+                    client::unmap(mapping);
+                    // A processor that kept the translation keeps the addresses too.
+                    if gpu.window.remove(start, pages) {
+                        gpu.window.release(start, pages);
+                    }
+                    return 0;
+                }
+                // Part of one mapping: a driver that over-maps to place a
+                // buffer at an offset releases the prefix it does not use, and
+                // its client keeps the rest, as Linux's munmap does.
+                if !client::unmap_pages(mapping, address, (last - address) as usize) {
+                    return EFAULT;
                 }
                 0
             }
@@ -411,11 +478,41 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 let mappings = gpu.mappings.borrow();
                 let found = mappings.range(..=address).next_back();
                 let Some((&start, &(mapping, pages))) = found else {
+                    output::arguments(format_args!(
+                        "GPU fault {address:#x}: no client mapping at or below it ({}) \n",
+                        mappings.len()
+                    ));
+                    report_events();
+                    report_mappings(&mappings, address);
                     return EFAULT;
                 };
-                if address >= start + pages as u64 * PAGE
-                    || !client::fill_around(mapping, address, write)
-                {
+                if address >= start + pages as u64 * PAGE {
+                    output::arguments(format_args!(
+                        "GPU fault {address:#x}: past the mapping at {start:#x} ({pages} pages, \
+                         ends {:#x})\n",
+                        start + pages as u64 * PAGE
+                    ));
+                    match mappings.range(address..).next() {
+                        Some((&at, &(_, pages))) => output::arguments(format_args!(
+                            "GPU fault {address:#x}: the next mapping above is {at:#x} \
+                             ({pages} pages), {:#x} bytes away\n",
+                            at - address
+                        )),
+                        None => output::arguments(format_args!(
+                            "GPU fault {address:#x}: no mapping above it\n"
+                        )),
+                    }
+                    report_events();
+                    report_mappings(&mappings, address);
+                    return EFAULT;
+                }
+                if !client::fill_around(mapping, address, write) {
+                    output::arguments(format_args!(
+                        "GPU fault {address:#x} (write={write}) in the mapping at {start:#x} \
+                         ({pages} pages): its page did not come back\n"
+                    ));
+                    report_events();
+                    report_mappings(&mappings, address);
                     return EFAULT;
                 }
                 0
@@ -765,8 +862,9 @@ fn request_code(operation: &Operation) -> u32 {
         Operation::Close(_) => HostCall::Close,
         Operation::Duplicate(_) => HostCall::Duplicate,
         Operation::Device(_) => HostCall::Device,
+        Operation::Seek { .. } => HostCall::Seek,
         Operation::Map { .. } => HostCall::Map,
-        Operation::Unmap(_) => HostCall::Unmap,
+        Operation::Unmap { .. } => HostCall::Unmap,
         Operation::Fault { .. } => HostCall::Fault,
         Operation::Thread(_) => HostCall::Thread,
         Operation::Wake => HostCall::Wake,
@@ -1427,9 +1525,12 @@ pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
     }
 }
 
-/// Removes the mapping [`map`] gave at `address`.
+/// Removes the mapping [`map`] gave at `address`, which is the whole of it.
 pub(super) fn unmap(address: NonNull<u8>) {
-    let result = submit(Operation::Unmap(address.as_ptr() as u64));
+    let result = submit(Operation::Unmap {
+        address: address.as_ptr() as u64,
+        size: usize::MAX,
+    });
     if result != 0 {
         output::arguments(format_args!("GPU unmap of {address:p} refused: {result}\n"));
     }
@@ -1444,6 +1545,10 @@ pub(super) fn query<T>(
 ) -> Option<T> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {
+        output::arguments(format_args!(
+            "GPU render node {} would not open: {fd}\n",
+            RENDER_MINOR + index
+        ));
         return None;
     }
     let answer = ask(&mut |request, argument| {
@@ -1478,6 +1583,118 @@ pub(in crate::engine) fn client_fault(address: u64) -> bool {
 /// power of two after it.
 static CLIENT_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// One call that changed or used the clients' window, for the history a
+/// refusal prints: a fault no mapping serves is read against the maps and
+/// unmaps that came before it.
+#[derive(Clone, Copy)]
+struct Event {
+    /// [`Event::MAP`], [`Event::UNMAP`], [`Event::MUNMAP`] or [`Event::FAULT`].
+    kind: u8,
+    /// The address, the size, and what else the kind means.
+    address: u64,
+    size: u64,
+    other: u64,
+    extra: u64,
+}
+
+impl Event {
+    const MAP: u8 = 1;
+    const UNMAP: u8 = 2;
+    const MUNMAP: u8 = 3;
+    const FAULT: u8 = 4;
+}
+
+/// The last events, behind a lock of its own: every processor reports its own
+/// calls, and a refusal prints the history whole.
+struct Events {
+    held: AtomicBool,
+    events: UnsafeCell<VecDeque<Event>>,
+}
+
+// SAFETY: only `with_events` reaches the queue, under `held`.
+unsafe impl Sync for Events {}
+
+impl Events {
+    fn with<T>(&self, body: impl FnOnce(&mut VecDeque<Event>) -> T) -> T {
+        while self
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: the held lock; nothing below re-enters it.
+        let result = body(unsafe { &mut *self.events.get() });
+        self.held.store(false, Ordering::Release);
+        result
+    }
+}
+
+static EVENTS: Events = Events {
+    held: AtomicBool::new(false),
+    events: UnsafeCell::new(VecDeque::new()),
+};
+
+/// How many events the history keeps.
+const EVENTS_SHOWN: usize = 96;
+
+fn record_event(event: Event) {
+    EVENTS.with(|events| {
+        if events.len() == EVENTS_SHOWN {
+            events.pop_front();
+        }
+        events.push_back(event);
+    });
+}
+
+/// The clients' window calls before a refusal, printed at once so the lines
+/// do not interleave with another processor's.
+fn report_events() {
+    EVENTS.with(|events| {
+    for event in events.iter() {
+        let (kind, other_name) = match event.kind {
+            Event::MAP => ("map", "fd"),
+            Event::UNMAP => ("unmap", "pages"),
+            Event::MUNMAP => ("munmap asked", "the mapping's pages"),
+            _ => ("fault", "write"),
+        };
+        output::arguments(format_args!(
+            "GPU EVENTS {kind}: address={:#x} size={:#x} {other_name}={:#x} offset={:#x}\n",
+            event.address, event.size, event.other, event.extra
+        ));
+    }
+    });
+}
+
+/// The return addresses on the stack of the client code that called in, which
+/// names the caller: a map, an unmap or a client's fault is reported with it.
+fn print_client_stack() {
+    let stack: *const u64;
+    // SAFETY: reads this context's stack pointer, whose page is mapped.
+    unsafe { asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: this context's own stack, from the pointer up its page.
+    unsafe { output::print_stack_at(stack) };
+}
+
+/// The window's client mappings either side of `address`, as the refusal of a
+/// client's fault reads them: what a mapping there would have come from.
+fn report_mappings(
+    mappings: &alloc::collections::BTreeMap<u64, (client::Mapping, usize)>,
+    address: u64,
+) {
+    const SHOWN: usize = 24;
+    output::arguments(format_args!(
+        "GPU MAPS with {} live mappings, around {address:#x}:\n",
+        mappings.len()
+    ));
+    for (at, &(_, pages)) in mappings.range(..address).rev().take(SHOWN) {
+        output::arguments(format_args!("GPU MAPS below {at:#x}: {pages} pages\n"));
+    }
+    for (at, &(_, pages)) in mappings.range(address..).take(SHOWN) {
+        output::arguments(format_args!("GPU MAPS above {at:#x}: {pages} pages\n"));
+    }
+}
+
 /// `rip` as an offset in this image.
 fn image_offset(rip: u64) -> u64 {
     unsafe extern "C" {
@@ -1493,7 +1710,14 @@ fn image_offset(rip: u64) -> u64 {
 pub(in crate::engine) fn serve_moved(address: u64, write: bool, rip: u64) {
     let thread = installed().and_then(current_thread).is_some();
     let count = CLIENT_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if count.is_power_of_two() {
+    record_event(Event {
+        kind: Event::FAULT,
+        address,
+        size: u64::from(write),
+        other: image_offset(rip),
+        extra: 0,
+    });
+    if count <= 8 || count.is_power_of_two() {
         output::arguments(format_args!(
             "GPU CLIENT FAULT address={address:#x} write={write} rip=+{:#x} processor={} \
              thread={} count={count}\n",
@@ -1504,6 +1728,9 @@ pub(in crate::engine) fn serve_moved(address: u64, write: bool, rip: u64) {
     }
     let result = submit(Operation::Fault { address, write });
     if result != 0 {
+        // The faulting client's own stack names what took the fault, which the
+        // refusal below reports before the handler stops on it.
+        print_client_stack();
         output::fatal(format_args!(
             "a GPU client fault at {address:#x} from +{:#x} on processor {} was not \
              served: {result}",
@@ -1699,6 +1926,17 @@ extern "C" fn stela_libc_drm_dup(fd: c_int) -> c_int {
     submit(Operation::Duplicate(fd)) as c_int
 }
 
+/// The descriptor's position, as lseek would: an import of a dma-buf seeks to
+/// its end for the size.
+#[unsafe(no_mangle)]
+extern "C" fn stela_libc_fd_seek(fd: c_int, offset: i64, whence: c_int) -> c_long {
+    submit(Operation::Seek {
+        fd,
+        offset,
+        whence,
+    }) as c_long
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_drm_rdev(fd: c_int) -> c_long {
     submit(Operation::Device(fd)) as c_long
@@ -1719,12 +1957,25 @@ extern "C" fn stela_libc_drm_mmap(fd: c_int, offset: u64, size: usize) -> *mut c
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn stela_libc_drm_munmap(address: *mut c_void, _size: usize) -> c_int {
+extern "C" fn stela_libc_drm_munmap(address: *mut c_void, size: usize) -> c_int {
     let mapped = installed().is_some_and(|gpu| gpu.window.contains(address as u64));
     if !mapped {
         return 0;
     }
-    let result = submit(Operation::Unmap(address as u64));
+    let pages = installed()
+        .and_then(|gpu| gpu.mappings.borrow().get(&(address as u64)).map(|entry| entry.1))
+        .unwrap_or(0);
+    record_event(Event {
+        kind: Event::MUNMAP,
+        address: address as u64,
+        size: size as u64,
+        other: pages as u64,
+        extra: 0,
+    });
+    let result = submit(Operation::Unmap {
+        address: address as u64,
+        size,
+    });
     if result < 0 { result as c_int } else { 1 }
 }
 

@@ -1109,8 +1109,9 @@ impl MemoryExporter for Exporter {
 }
 
 fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
-    // A stack whose port drives the GPU but links no Vulkan driver for it,
-    // which the Intel stack is today, has no Metal device to serve.
+    // A stack whose port drives the GPU but links no Vulkan driver for it has
+    // no Metal device to serve, and the boot says so instead of starting a
+    // guest whose WindowServer would have nothing to draw through.
     let Some(driver) = gpu.stack.vulkan.as_ref() else {
         return Err(OpenError::Device(Error::Invalid(
             "this stack links no Vulkan driver for its Metal device",

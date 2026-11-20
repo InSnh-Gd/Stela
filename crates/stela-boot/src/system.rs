@@ -37,6 +37,25 @@ use crate::native_smp::resources::{Resources as NativeResources, STACK_BYTES, ST
 mod handoff_phase;
 mod memory;
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+/// The heap this image aims for, which [`memory`]'s sizing takes from the
+/// guest as far as the guest's room allows.
+///
+/// The product's [`stela_boot_core::host_memory`] target is what the
+/// NVIDIA stack's desktop sessions measured. The Intel (xe) port's guest
+/// driver is Linux's `xe` over TTM, which populates every buffer object
+/// with `MAX_PAGE_ORDER` pages: its bring-up asked for 4 MiB aligned to
+/// 4 MiB 249 times before Metal opened (996 MiB of pages), and each such
+/// request costs the heap another full 4 MiB, since no block can hold a
+/// 4 MiB payload 4 MiB aligned after its own header. Mesa's NIR compile for
+/// the same bring-up held another 1635 MiB in one block, so the port aims
+/// at twice the product's target and the guest's room still bounds it.
+const XE_HEAP_AIM: u64 = 8 * GIB;
+const HEAP_AIM: u64 = if cfg!(feature = "xe") {
+    XE_HEAP_AIM
+} else {
+    stela_boot_core::host_memory::HEAP_TARGET
+};
 /// The loader heap's free bytes kept past boot services, for what still runs
 /// before the engine does; the rest of it goes to the guest.
 const LOADER_HEAP_KEPT: usize = 16 * MIB as usize;
@@ -413,7 +432,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
     }
     // The Metal device's pipelines, rewritten over the translation store's
     // partition.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal")]
     if files.len() < MAX_FILES
         && let Some(store) = crate::engine::pipelines::read()
     {
@@ -670,7 +689,7 @@ fn translation_store(
     // Without a memory map the pack gets nothing; the parts' sizing
     // reports the map's absence.
     let free = free_ram().map_or(0, |free| free.saturating_sub(pending));
-    let budget = stela_boot_core::host_memory::pack_budget(free, cores, cores);
+    let budget = stela_boot_core::host_memory::pack_budget_aiming(free, cores, cores, HEAP_AIM);
     let Some(store) = crate::engine::translations::read(budget) else {
         crate::status::done("none on this USB");
         return (files, storage);

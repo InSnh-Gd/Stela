@@ -198,7 +198,7 @@ pub(super) fn host_drivers_held_here() -> bool {
 /// Whether this activated processor holds the host drivers' lock, which
 /// every Linux entry holds on whichever processor it runs: one load while
 /// nobody holds it, and no RDMSR.
-#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(super) fn holds_host_drivers() -> bool {
     HOST_DRIVERS.load(Ordering::Acquire)
         && HOST_DRIVERS_GS.load(Ordering::Acquire) == super::host::activated_base()
@@ -208,7 +208,7 @@ pub(super) fn holds_host_drivers() -> bool {
 /// Linux entry running on another processor: holding the host drivers'
 /// lock, taken only when free (`None` when another processor holds it), or
 /// as this processor already does. No root changes and no driver is called.
-#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(super) fn with_drivers_held<T>(read: impl FnOnce() -> T) -> Option<T> {
     if holds_host_drivers() {
         return Some(read());

@@ -31,11 +31,15 @@ test = false
 default = []
 diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
+# Stela's Metal device over the Vulkan driver the image links, which
+# `cargo xtask gpu nvk` builds: the guest reaches the GPU through it whichever
+# vendor's stack drives the hardware below.
+metal = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
-nvk = ["dep:stela-mesa", "stela-drivers/metal-linked", "stela-drivers/nouveau-port"]
+nvk = ["metal", "stela-drivers/nouveau-port"]
 # The xe port: Linux's Intel driver for this PC's own Xe3P GPU. An image
 # carries one port at a time, so this and `nvk` cannot be selected together.
-xe = ["stela-drivers/xe-port"]
+xe = ["metal", "stela-drivers/xe-port"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

@@ -88,7 +88,7 @@ pub(crate) fn moved_here() -> bool {
 /// has, if any, is waited for, for at most `ticks` TSC ticks: the GPUs'
 /// stop, whose Linux work changes interrupt routes and unloads firmware,
 /// runs on the boot processor only. Whether none runs in its place now.
-#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn close_moves(ticks: u64) -> bool {
     MOVES_CLOSED.store(true, Ordering::SeqCst);
     let start = crate::engine::host::rdtsc();

@@ -46,7 +46,7 @@ const HEAP_SHARE: u64 = 8;
 /// million free extents, the largest 194-272 MiB, and peaked at 4063 MiB
 /// when NAK compiled Core Animation's generic shader 8 hours in: defined
 /// at that window, the target would leave such a session 33 MiB.
-const HEAP_TARGET: u64 = 4 * GIB;
+pub const HEAP_TARGET: u64 = 4 * GIB;
 /// The guest DRAM [`HEAP_TARGET`] leaves at least: twice [`GUEST_FLOOR`].
 /// A guest under it keeps the heap's share or floor, so 8 GiB hosts boot
 /// with what they had.
@@ -202,12 +202,24 @@ impl Shortfall {
 ///
 /// A guest share under [`GUEST_FLOOR`] is a [`Shortfall`].
 pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
-    let estimate = estimate(free, cores, runners)?;
+    sizes_aiming(free, cores, runners, HEAP_TARGET)
+}
+
+/// [`sizes`] with the heap's aim named by the caller: [`HEAP_TARGET`], or
+/// what the image's GPU stack needs instead. An image carries one port at a
+/// time, and a port's guest driver decides what its bring-up holds: the
+/// Intel (xe) port's is Linux's `xe` over TTM, which populates a buffer
+/// object with `MAX_PAGE_ORDER` pages and so asks for 4 MiB aligned to
+/// 4 MiB, fifty times over before the desktop is up. Each such request
+/// leaves the heap a 4 MiB extent it cannot place again, so the port aims
+/// at twice the product's target, and the guest's room still bounds it.
+pub fn sizes_aiming(free: u64, cores: usize, runners: usize, aim: u64) -> Result<Sizes> {
+    let estimate = estimate(free, cores, runners, aim)?;
     if estimate.guest >= GUEST_FLOOR {
         return Ok(estimate);
     }
     let mut needed = free.next_multiple_of(NEEDED_STEP);
-    while estimate_guest(needed, cores, runners)? < GUEST_FLOOR {
+    while estimate_guest(needed, cores, runners, aim)? < GUEST_FLOOR {
         needed += NEEDED_STEP;
     }
     Err(Shortfall { free, needed }.refusal())
@@ -221,10 +233,15 @@ pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
 /// allocations. Zero, below [`PACK_FLOOR`]: the parts and the guest come
 /// first, and the pack never makes a boot fail.
 pub fn pack_budget(free: u64, cores: usize, runners: usize) -> u64 {
+    pack_budget_aiming(free, cores, runners, HEAP_TARGET)
+}
+
+/// [`pack_budget`] for [`sizes_aiming`] with the same `aim`.
+pub fn pack_budget_aiming(free: u64, cores: usize, runners: usize, aim: u64) -> u64 {
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
     while budget >= PACK_FLOOR {
         let left = free.saturating_sub(budget + PACK_MARGIN);
-        if estimate_guest(left, cores, runners).is_ok_and(|guest| guest >= GUEST_FLOOR) {
+        if estimate_guest(left, cores, runners, aim).is_ok_and(|guest| guest >= GUEST_FLOOR) {
             return budget;
         }
         budget -= ALIGNMENT;
@@ -232,25 +249,31 @@ pub fn pack_budget(free: u64, cores: usize, runners: usize) -> u64 {
     0
 }
 
-fn estimate_guest(free: u64, cores: usize, runners: usize) -> Result<u64> {
-    estimate(free, cores, runners).map(|sizes| sizes.guest)
+fn estimate_guest(free: u64, cores: usize, runners: usize, aim: u64) -> Result<u64> {
+    estimate(free, cores, runners, aim).map(|sizes| sizes.guest)
 }
 
 /// The sizes with the larger code window per runner, or with the smaller
 /// one where the larger would leave the guest under its floor.
-fn estimate(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
-    let large = estimate_with(free, cores, runners, WINDOW_PER_RUNNER)?;
+fn estimate(free: u64, cores: usize, runners: usize, aim: u64) -> Result<Sizes> {
+    let large = estimate_with(free, cores, runners, WINDOW_PER_RUNNER, aim)?;
     if large.guest >= GUEST_FLOOR {
         return Ok(large);
     }
-    estimate_with(free, cores, runners, SMALL_WINDOW_PER_RUNNER)
+    estimate_with(free, cores, runners, SMALL_WINDOW_PER_RUNNER, aim)
 }
 
-fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Result<Sizes> {
+fn estimate_with(
+    free: u64,
+    cores: usize,
+    runners: usize,
+    per_runner: u64,
+    aim: u64,
+) -> Result<Sizes> {
     let code = code_reservation_per_runner(free, cores, runners, per_runner)?;
     let shared = shared_heap(free, runners, code.window);
     let base = split(free, shared, code, cores, runners);
-    let target = at_window(HEAP_TARGET, code.window).min(HEAP_CEILING.max(shared));
+    let target = at_window(aim, code.window).min(HEAP_CEILING.max(shared));
     if target <= shared || base.guest <= GUEST_ROOM {
         return Ok(base);
     }
