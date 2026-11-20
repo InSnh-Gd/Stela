@@ -268,6 +268,11 @@ impl TexelBufferAlignment {
     }
 }
 
+/// The coarsest row alignment Metal answers for IOSurface textures
+/// ([`Capabilities::surface_row_alignment`]): NVIDIA's linear images' 32
+/// bytes, which the surfaces Core Image renders through are laid out to.
+pub const SURFACE_ROW_ALIGNMENT: u64 = 32;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
     pub name: String,
@@ -334,6 +339,13 @@ pub struct Capabilities {
     /// read and write the attachment as storage in a fragment shader
     /// interlock section.
     pub framebuffer_reads: bool,
+    /// `VK_KHR_shader_storage_image_multisample`: storage views of multisampled
+    /// attachments (`samples > 1`). Single-sample attachments do not need it.
+    pub multisample_storage_images: bool,
+    /// Single-sample (`samples == 1`) color attachments may be read as storage
+    /// even when the device lacks `shaderStorageImageMultisample` and keeps
+    /// `framebuffer_reads` / `Apple3` off for the guest.
+    pub single_sample_attachment_reads: bool,
     /// Fragment functions can run the fragment tests themselves, on copies
     /// of the pass's depth and stencil attachments in their interlock
     /// section: those that write the stencil reference on a device without
@@ -488,6 +500,21 @@ impl Capabilities {
         }
     }
 
+    /// `iosurfaceTextureAlignmentBytes` and
+    /// `iosurfaceReadOnlyTextureAlignmentBytes`: what the rows of a surface
+    /// a texture uses must be a multiple of. A texture takes rows of any
+    /// whole number of pixels, the GPU sampling and rendering those its
+    /// linear images cannot address through an aligned copy
+    /// ([`resource::aligned_copy`]), so the answer need not be the linear
+    /// images' own alignment: it is that alignment, at most NVIDIA's 32
+    /// bytes. Core Image makes no texture of a surface whose rows miss it and
+    /// hands its image processors nil instead.
+    ///
+    /// [`resource::aligned_copy`]: crate::metal::resource::aligned_copy
+    pub fn surface_row_alignment(&self) -> u64 {
+        self.linear_row_alignment.min(SURFACE_ROW_ALIGNMENT)
+    }
+
     /// Row-pitch and offset alignments of linear textures inside buffers.
     /// Metal reports their maximum; creation checks each separately.
     pub fn linear_texture_alignments(&self) -> (u64, u64) {
@@ -626,6 +653,16 @@ pub fn fragment_tests(device: &PhysicalDevice) -> bool {
     device.features.fragment_shader_pixel_interlock && depth_stencil_copies(device)
 }
 
+/// Whether a fragment function may read single-sample attachments it writes:
+/// what a raster order group orders, served by giving the attachment a storage
+/// view (its storage copy when the pipeline cannot test fragments first).
+/// Multisampled attachments additionally require
+/// `shader_storage_image_multisample`.
+pub fn attachment_reads(device: &PhysicalDevice) -> bool {
+    let features = &device.features;
+    features.fragment_shader_pixel_interlock && features.dynamic_rendering_local_read
+}
+
 impl Derivation<'_> {
     fn cause(&self, requirement: &Requirement) -> Option<Cause> {
         if !requirement.driver {
@@ -738,17 +775,26 @@ impl Derivation<'_> {
             }),
             ApiFeatures::PROGRAMMABLE_SAMPLE_POSITIONS,
         ));
+        // Announcing raster order groups without the storage view of
+        // [`attachment_reads`] tells the guest to read attachments whose
+        // pipelines the port then refuses, which leaves its draw undone.
+        // Single-sample attachment reads work without
+        // `shaderStorageImageMultisample`; multisampled attachment reads are
+        // still gated by `multisample_storage_images` at pipeline creation.
+        let reads_attachments = attachment_reads(self.device);
+        let single_sample_attachment_reads = reads_attachments
+            && self.shaders.contains(ShaderFeatures::RASTER_ORDER_GROUPS);
         let raster_order_groups = self.check(shader(
             "raster order groups",
-            features.fragment_shader_pixel_interlock,
+            reads_attachments,
             ShaderFeatures::RASTER_ORDER_GROUPS,
         ));
-        let framebuffer_reads = raster_order_groups
-            && self.check(api(
+        let framebuffer_reads =
+            self.check(api(
                 "framebuffer reads",
-                features.dynamic_rendering_local_read && features.shader_storage_image_multisample,
+                reads_attachments,
                 ApiFeatures::EMPTY,
-            ));
+            )) && raster_order_groups;
         // A stencil output without stencil export, or storage attachments
         // whose pipeline cannot test fragments first: the function tests
         // fragments on storage copies of the attachments, which image copies
@@ -1029,6 +1075,8 @@ impl Derivation<'_> {
             statistic_counters: statistics,
             memoryless_render_targets: true,
             framebuffer_reads,
+            multisample_storage_images: features.shader_storage_image_multisample,
+            single_sample_attachment_reads,
             fragment_tests,
             stencil_export: limits.stencil_export,
             stencil_follows_depth,
@@ -1098,10 +1146,7 @@ impl Derivation<'_> {
     /// Whether fragment functions may write attachments as storage in their
     /// interlock section: framebuffer reads' requirements, unrecorded.
     fn storage_attachments(&self) -> bool {
-        let features = &self.device.features;
-        features.fragment_shader_pixel_interlock
-            && features.dynamic_rendering_local_read
-            && features.shader_storage_image_multisample
+        attachment_reads(self.device)
             && self.shaders.contains(ShaderFeatures::RASTER_ORDER_GROUPS)
     }
 
@@ -1230,8 +1275,8 @@ impl Derivation<'_> {
             .map(|raw| self.device.formats.get(raw))
             .filter(|raw| raw.optimal.contains(F::COLOR_ATTACHMENT | F::STORAGE_IMAGE));
         let raw_render = raw_support.is_some();
-        let raw_multisample =
-            raw_support.is_some_and(|raw| raw.sample_counts.contains(SampleCounts::C4));
+        let raw_multisample = self.device.features.shader_storage_image_multisample
+            && raw_support.is_some_and(|raw| raw.sample_counts.contains(SampleCounts::C4));
         let depth_stencil = !color
             && !description.view_only
             && raster
@@ -1601,7 +1646,9 @@ impl Derivation<'_> {
         ]
         .into_iter()
         .all(|packed| format(packed, render | FormatCapabilities::FILTER));
-        let apple3 = mac2 && capabilities.framebuffer_reads;
+        let apple3 = mac2
+            && capabilities.framebuffer_reads
+            && capabilities.multisample_storage_images;
         let apple1 = apple3
             && self.check_all(
                 "GPU family Apple1",

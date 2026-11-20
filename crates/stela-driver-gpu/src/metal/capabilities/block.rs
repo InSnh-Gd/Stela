@@ -27,7 +27,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 /// "STCB": a Stela capability block.
 pub const MAGIC: [u8; 4] = *b"STCB";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const NAME_BYTES: usize = 256;
 pub const ARCHITECTURE_BYTES: usize = 64;
 pub const FAMILIES: usize = 32;
@@ -87,6 +87,10 @@ option_set! {
         const STENCIL_EXPORT = 1 << 38;
         /// Lines rasterize as Apple GPUs' (`Capabilities::line_modes`).
         const LINE_MODES = 1 << 39;
+        /// `shaderStorageImageMultisample`.
+        const MULTISAMPLE_STORAGE_IMAGES = 1 << 40;
+        /// Single-sample attachment reads.
+        const SINGLE_SAMPLE_ATTACHMENT_READS = 1 << 41;
     }
 }
 
@@ -173,6 +177,9 @@ pub struct Block {
     pub linear_row_alignment: u64,
     pub linear_offset_alignment: u64,
     pub texel_buffer_alignment: u64,
+    /// [`Capabilities::surface_row_alignment`], derived from
+    /// `linear_row_alignment`.
+    pub surface_row_alignment: u64,
     pub limits: BlockLimits,
     /// Raw `MTLGPUFamily` values.
     pub families: [u64; FAMILIES],
@@ -188,7 +195,7 @@ pub struct Block {
 const _: () = assert!(core::mem::size_of::<Block>() == Block::BYTES);
 
 impl Block {
-    pub const BYTES: usize = 10672;
+    pub const BYTES: usize = 10680;
 
     const EMPTY: Self = Self {
         magic: MAGIC,
@@ -217,6 +224,7 @@ impl Block {
         linear_row_alignment: 0,
         linear_offset_alignment: 0,
         texel_buffer_alignment: 0,
+        surface_row_alignment: 0,
         limits: BlockLimits {
             max_threads_per_threadgroup: [0; 3],
             max_total_threads_per_threadgroup: 0,
@@ -371,6 +379,8 @@ impl Block {
             statistic_counters: has(Flags::STATISTIC_COUNTERS),
             memoryless_render_targets: has(Flags::MEMORYLESS_RENDER_TARGETS),
             framebuffer_reads: has(Flags::FRAMEBUFFER_READS),
+            multisample_storage_images: has(Flags::MULTISAMPLE_STORAGE_IMAGES),
+            single_sample_attachment_reads: has(Flags::SINGLE_SAMPLE_ATTACHMENT_READS),
             fragment_tests: has(Flags::FRAGMENT_TESTS),
             stencil_export: has(Flags::STENCIL_EXPORT),
             stencil_follows_depth: has(Flags::STENCIL_FOLLOWS_DEPTH),
@@ -628,6 +638,14 @@ impl Capabilities {
                 self.memoryless_render_targets,
             )
             .with(Flags::FRAMEBUFFER_READS, self.framebuffer_reads)
+            .with(
+                Flags::MULTISAMPLE_STORAGE_IMAGES,
+                self.multisample_storage_images,
+            )
+            .with(
+                Flags::SINGLE_SAMPLE_ATTACHMENT_READS,
+                self.single_sample_attachment_reads,
+            )
             .with(Flags::FRAGMENT_TESTS, self.fragment_tests)
             .with(Flags::STENCIL_EXPORT, self.stencil_export)
             .with(Flags::STENCIL_FOLLOWS_DEPTH, self.stencil_follows_depth)
@@ -651,6 +669,7 @@ impl Capabilities {
         block.linear_row_alignment = self.linear_row_alignment;
         block.linear_offset_alignment = self.linear_offset_alignment;
         block.texel_buffer_alignment = self.texel_buffer_alignment.bytes;
+        block.surface_row_alignment = self.surface_row_alignment();
         let size = limits.max_threads_per_threadgroup;
         block.limits = BlockLimits {
             max_threads_per_threadgroup: [size.width, size.height, size.depth],
@@ -733,6 +752,25 @@ mod tests {
 
         block.formats[1].format = u32::MAX;
         assert_eq!(block.capabilities(), Err(MALFORMED));
+    }
+
+    #[test]
+    fn surface_textures_take_rows_of_nvidias_alignment_at_most() {
+        for (linear, surface) in [(256, 32), (128, 32), (32, 32), (16, 16)] {
+            let mut capabilities = fixture::capabilities();
+            capabilities.linear_row_alignment = linear;
+            assert_eq!(capabilities.surface_row_alignment(), surface);
+            let block = capabilities.block().unwrap();
+            assert_eq!(block.surface_row_alignment, surface);
+            assert_eq!(
+                block.linear_row_alignment, linear,
+                "linear images keep theirs"
+            );
+            assert_eq!(block.capabilities().unwrap(), capabilities);
+        }
+        let mut block = fixture::capabilities().block().unwrap();
+        block.surface_row_alignment += 1;
+        assert!(block.capabilities().is_err());
     }
 
     #[test]

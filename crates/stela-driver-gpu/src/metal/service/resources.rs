@@ -174,9 +174,33 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// A band at a time ([`Device::cpu_bands`]), so a texture of any size
     /// moves through a bounded amount of memory.
     pub(super) fn replace_region(&mut self, call: &mut Call) -> Result<(), Fault> {
+        self.device.timing().begin(Timed::ReplaceRegion);
         let transfer = self.transfer(call)?;
+        let format = self
+            .device
+            .texture_descriptor(transfer.texture)?
+            .pixel_format;
+        self.device.timing().detail(
+            Timed::ReplaceRegion,
+            Detail::Bytes {
+                format,
+                width: transfer
+                    .bands
+                    .first()
+                    .map_or(0, |(region, _)| region.size[0]),
+                rows: transfer
+                    .bands
+                    .iter()
+                    .map(|(region, _)| region.size[1])
+                    .sum(),
+                bands: transfer.bands.len() as u64,
+                bytes: transfer.bands.iter().map(|(_, span)| span.length).sum(),
+            },
+        );
         for (region, span) in transfer.bands {
+            let start = self.device.timing().now();
             let bytes = call.memory.read(span)?;
+            self.device.timing().since(Phase::RegionRead, start);
             self.device
                 .replace_region(transfer.texture, &region, &bytes, transfer.strides)?;
         }

@@ -31,28 +31,34 @@ pub fn no_clock() -> u64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Timed {
     NewTexture,
+    ReplaceRegion,
     GetBytes,
     NewRenderPipeline,
     Commit,
     NewFunction,
+    Release,
 }
 
 impl Timed {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::NewTexture,
+        Self::ReplaceRegion,
         Self::GetBytes,
         Self::NewRenderPipeline,
         Self::Commit,
         Self::NewFunction,
+        Self::Release,
     ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::NewTexture => "new_texture",
+            Self::ReplaceRegion => "replace_region",
             Self::GetBytes => "get_bytes",
             Self::NewRenderPipeline => "new_render_pipeline",
             Self::Commit => "commit",
             Self::NewFunction => "new_function",
+            Self::Release => "release",
         }
     }
 
@@ -70,6 +76,7 @@ impl Timed {
                 TextureDescriptors,
                 TextureCpuCopy,
             ],
+            Self::ReplaceRegion => &[RegionRead, RegionPack, RegionCopy],
             Self::GetBytes => &[BytesRead, BytesCopy, BytesDecode, BytesUnpack, BytesWrite],
             Self::NewRenderPipeline => &[
                 PipelineSpecialize,
@@ -89,6 +96,7 @@ impl Timed {
                 CommitCompile,
             ],
             Self::NewFunction => &[FunctionReflect],
+            Self::Release => &[ReleaseFind, ReleaseDrop],
         }
     }
 }
@@ -96,6 +104,20 @@ impl Timed {
 /// A phase of a [`Timed`] operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
+    /// Finding the object a release names: its handle, the connection's
+    /// table and the serial it was made at.
+    ReleaseFind,
+    /// Dropping it: the device's own release of what it holds, the
+    /// connection's entry and its byte count.
+    ReleaseDrop,
+    /// Reading the caller's bytes out of its memory. A texture move of a
+    /// large one reads them once per band.
+    RegionRead,
+    /// The block run, the copy's shape and the packing of its rows.
+    RegionPack,
+    /// Writing the image: the host image copy (and the zeroing before it),
+    /// the CPU copy's memory, or the encoding's store.
+    RegionCopy,
     /// Deriving the Vulkan image and views from the descriptor.
     TexturePlan,
     /// Looking for a destroyed texture to reuse.
@@ -185,6 +207,11 @@ impl Phase {
     pub const fn name(self) -> &'static str {
         use Phase::*;
         match self {
+            ReleaseFind => "find",
+            ReleaseDrop => "drop",
+            RegionRead => "read",
+            RegionPack => "pack",
+            RegionCopy => "copy",
             TexturePlan | PipelinePlan => "plan",
             TextureRecycle => "recycle",
             TextureCreate | PipelineCreate => "create",
@@ -268,8 +295,14 @@ pub enum Detail {
         entry: Name,
     },
     Commit {
+        /// The bytes of the caller's command stream.
         stream: u64,
+        /// The bytes its uploads copy into chunks.
         uploads: u64,
+        /// The commands those bytes replayed into, the ones the record
+        /// phase is spent on: a long one of either many commands or few
+        /// expensive ones wants a different fix.
+        commands: u64,
     },
 }
 
@@ -305,8 +338,12 @@ impl fmt::Display for Detail {
                 fragment.as_ref().map_or("-", Name::as_str)
             ),
             Self::Function { entry } => write!(formatter, " entry={}", entry.as_str()),
-            Self::Commit { stream, uploads } => {
-                write!(formatter, " stream={stream} uploads={uploads}")
+            Self::Commit {
+                stream,
+                uploads,
+                commands,
+            } => {
+                write!(formatter, " stream={stream} uploads={uploads} commands={commands}")
             }
         }
     }

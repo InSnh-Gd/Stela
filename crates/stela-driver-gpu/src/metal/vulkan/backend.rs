@@ -464,7 +464,16 @@ pub struct Requirement {
 
 /// The features the binding ABI, dynamic state model and synchronization
 /// rely on; a device missing any is refused rather than half-supported.
-pub fn requirements(features: &Features) -> [Requirement; 20] {
+///
+/// `VK_KHR_unified_image_layouts` is deliberately not among them. The
+/// one-layout-per-image model it promises is kept by the backend itself:
+/// the native backend moves each new image from `VK_IMAGE_LAYOUT_UNDEFINED`
+/// to `VK_IMAGE_LAYOUT_GENERAL` once, on the host, and uses no other layout
+/// afterwards (`native/record.rs`), so a driver that would rather have its
+/// own layouts is never asked to leave them. [`Features`] still reports
+/// what the driver offers, which is what a backend that leaned on the
+/// driver's promise would read.
+pub fn requirements(features: &Features) -> [Requirement; 19] {
     let requirement = |name, present| Requirement { name, present };
     [
         requirement("bufferDeviceAddress", features.buffer_device_address),
@@ -497,7 +506,6 @@ pub fn requirements(features: &Features) -> [Requirement; 20] {
             "extendedDynamicState",
             features.extended_dynamic_state && features.extended_dynamic_state2,
         ),
-        requirement("unifiedImageLayouts", features.unified_image_layouts),
         requirement(
             "maintenance5",
             features.maintenance4 && features.maintenance5,

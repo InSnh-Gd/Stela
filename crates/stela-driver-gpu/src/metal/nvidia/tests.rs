@@ -261,6 +261,65 @@ fn sparse_textures_need_residency_feedback() {
 }
 
 #[test]
+fn a_device_without_multisampled_storage_images_keeps_single_sample_framebuffer_reads() {
+    let chip = Chip::find(0x172).unwrap();
+    let mut device = nvk(&chip, 16 << 30);
+    // Intel's driver reports no multisampled storage images, so only
+    // multisampled attachment reads, raw-render and depth/stencil storage copies
+    // are disabled while single-sample framebuffer reads work.
+    device.features.shader_storage_image_multisample = false;
+    let capabilities = Capabilities::derive(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    let cause = |name: &str| {
+        capabilities
+            .gaps()
+            .iter()
+            .find(|gap| gap.capability == name)
+            .map(|gap| gap.cause)
+    };
+    assert!(!capabilities.raster_order_groups);
+    assert!(!capabilities.framebuffer_reads);
+    assert!(!capabilities.multisample_storage_images);
+    assert!(capabilities.single_sample_attachment_reads);
+    assert!(!capabilities.stencil_follows_depth);
+    assert_eq!(cause("raster order groups"), Some(Cause::Driver));
+    assert_eq!(cause("framebuffer reads"), Some(Cause::Driver));
+    assert!(!capabilities.supports_family(GpuFamily::Apple3));
+    assert!(!capabilities.supports_family(GpuFamily::Apple1));
+}
+
+#[test]
+fn a_device_without_pixel_interlock_claims_no_raster_order_groups() {
+    let chip = Chip::find(0x172).unwrap();
+    let mut device = nvk(&chip, 16 << 30);
+    device.features.fragment_shader_pixel_interlock = false;
+    let capabilities = Capabilities::derive(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    let cause = |name: &str| {
+        capabilities
+            .gaps()
+            .iter()
+            .find(|gap| gap.capability == name)
+            .map(|gap| gap.cause)
+    };
+    assert!(!capabilities.raster_order_groups);
+    assert!(!capabilities.framebuffer_reads);
+    assert_eq!(cause("raster order groups"), Some(Cause::Driver));
+    assert_eq!(cause("framebuffer reads"), Some(Cause::Driver));
+    // Apple's families are the conjunction that starts at framebuffer reads.
+    assert!(!capabilities.supports_family(GpuFamily::Apple1));
+    assert!(!capabilities.supports_family(GpuFamily::Apple7));
+}
+
+#[test]
 fn missing_families_name_the_layer_that_lacks_them() {
     let capabilities = complete(Chip::find(0x172).unwrap());
     let cause = |name: &str| {

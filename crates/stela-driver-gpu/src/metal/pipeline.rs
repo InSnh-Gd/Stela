@@ -686,7 +686,19 @@ pub fn storage_attachments(
         return Ok(attachments);
     }
     if fragment.attachment_reads != 0 {
-        require(capabilities.framebuffer_reads, "framebuffer reads")?;
+        let supported = capabilities.framebuffer_reads
+            || (targets.raster_sample_count <= 1 && capabilities.single_sample_attachment_reads);
+        require(supported, "framebuffer reads")?;
+        require(
+            targets.raster_sample_count <= 1 || capabilities.multisample_storage_images,
+            "multisampled framebuffer reads",
+        )?;
+    }
+    if raw != 0 {
+        require(
+            targets.raster_sample_count <= 1 || capabilities.multisample_storage_images,
+            "multisampled raw render",
+        )?;
     }
     require(
         tests_first(fragment, targets) || capabilities.fragment_tests,
@@ -731,7 +743,10 @@ fn blended_extended_range(
     fragment: &Interface,
     targets: &RenderTargets,
 ) -> u32 {
-    if !capabilities.framebuffer_reads || !tests_first(fragment, targets) {
+    if !capabilities.framebuffer_reads
+        || !capabilities.multisample_storage_images
+        || !tests_first(fragment, targets)
+    {
         return 0;
     }
     targets
@@ -1234,6 +1249,10 @@ pub fn tile_target(
 ) -> Result<TileTarget> {
     require(capabilities.framebuffer_reads, "tile functions")?;
     let samples = samples.max(1);
+    require(
+        samples <= 1 || capabilities.multisample_storage_images,
+        "multisampled tile functions",
+    )?;
     require(
         capabilities.supports_texture_sample_count(samples),
         "tile pipeline sample count",

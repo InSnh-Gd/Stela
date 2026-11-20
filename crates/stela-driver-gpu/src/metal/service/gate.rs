@@ -64,6 +64,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     ) -> Result<(), CallerFault> {
         // A record out of reach names no operation.
         self.served = (0, Status::Closed);
+        self.noted = None;
         let mut raw = [0; size_of::<GateCall>()];
         caller.read(record, &mut raw)?;
         let mut call: GateCall = wire::read(&raw).expect("a record of its own size");
@@ -142,7 +143,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                                 .map_or(0, |held| held.allocated >> 20),
                         )
                     }
-                    None => format!("{fault} in operation {}", call.operation),
+                    None => match self.noted.as_deref() {
+                        Some(note) => format!("{fault} in operation {} ({note})", call.operation),
+                        None => format!("{fault} in operation {}", call.operation),
+                    },
                 });
                 self.refused.append(&mut book);
                 match fault.raw {

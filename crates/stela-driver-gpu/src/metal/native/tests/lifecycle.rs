@@ -203,6 +203,7 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
         outstanding: None,
         new_images: Vec::new(),
         zeroing: crate::metal::native::zero::Zeroing::new(1 << 32, |_| {}),
+        fillable_types: u32::MAX,
         bind_timeline: vk::Semaphore::null(),
         bind_value: 0,
         accumulate: vk::Pipeline::null(),

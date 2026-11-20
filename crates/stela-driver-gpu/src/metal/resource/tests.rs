@@ -367,6 +367,11 @@ fn managed_textures_use_host_image_copies() {
     assert_eq!(plan.cpu_access, CpuAccess::HostImageCopy);
     assert!(plan.image.usage.contains(ImageUsage::HOST_TRANSFER));
     assert_eq!(plan.memory.required, M::DEVICE_LOCAL);
+    assert_eq!(plan.memory.preferred, M::HOST_CACHED);
+
+    managed.options.cpu_cache_mode = CpuCacheMode::WriteCombined;
+    let wc = texture(&capabilities(), &managed).unwrap();
+    assert_eq!(wc.memory.preferred, M::EMPTY);
 }
 
 #[test]
@@ -376,6 +381,11 @@ fn shared_textures_use_host_image_copies() {
     let plan = texture(&capabilities(), &shared).unwrap();
     assert_eq!(plan.cpu_access, CpuAccess::HostImageCopy);
     assert!(plan.image.usage.contains(ImageUsage::HOST_TRANSFER));
+    assert_eq!(plan.memory.preferred, M::HOST_CACHED);
+
+    let mut private = descriptor(TextureType::D2, PixelFormat::Rgba8Unorm);
+    private.options = options(StorageMode::Private);
+    assert_eq!(texture(&capabilities(), &private).unwrap().memory.preferred, M::EMPTY);
 }
 
 /// On Apple GPUs every storage mode is unified memory: shared textures of

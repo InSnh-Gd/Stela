@@ -5,8 +5,8 @@
 //! primary command buffer of the device's universal queue. Each command
 //! buffer starts with descriptor set 0 bound at the graphics and compute
 //! bind points over the device's single pipeline layout. Every image stays
-//! in `VK_IMAGE_LAYOUT_GENERAL` (`unifiedImageLayouts`), so synchronization
-//! needs only global memory barriers.
+//! in `VK_IMAGE_LAYOUT_GENERAL`, which the native backend keeps itself, so
+//! synchronization needs only global memory barriers.
 use super::{
     AttachmentLoadOp, AttachmentStoreOp, CompareOp, CullMode, Filter, FrontFace, ImageAspects,
     IndexType, PipelineBindPoint, PipelineStages, PolygonMode, PrimitiveTopology, ResolveModes,

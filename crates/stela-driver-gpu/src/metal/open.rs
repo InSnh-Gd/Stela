@@ -85,8 +85,7 @@ pub struct Admission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refusal {
     Nvidia(nvidia::Refusal),
-    /// The Intel stack's own refusal: the image links no Vulkan driver over
-    /// its xe port, so the GPU has no Metal device.
+    /// The Intel stack's own refusal, in the xe port's and ANV's terms.
     Intel(intel::Refusal),
 }
 

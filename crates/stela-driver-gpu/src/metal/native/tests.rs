@@ -128,6 +128,10 @@ fn mapped_requests_need_host_visible_memory() {
         ..private
     };
     assert_eq!(objects::memory_candidates(&memory(), u32::MAX, mapped), [3]);
+    assert_eq!(
+        objects::zeroable_memory_candidates(&memory(), u32::MAX, private, 0b1000),
+        [3, 0]
+    );
 }
 
 #[test]

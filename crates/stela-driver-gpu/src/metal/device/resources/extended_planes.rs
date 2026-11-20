@@ -688,30 +688,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             color_bytes_per_row: narrow(planes[0].bytes_per_row)?,
             alpha: address + planes[1].offset,
             alpha_bytes_per_row: narrow(planes[1].bytes_per_row)?,
-            loads: loads && !current,
+            loads,
             stores,
             // What it does not draw keeps the planes' codes, whether its
             // image held them or it decodes them.
-            narrows: loads,
+            narrows: false,
             // A surface followed decodes all of it, after which its image
             // holds the planes.
-            decodes_whole: surface.is_some(),
+            decodes_whole: true,
             // The mirror holds what the planes do where the image did, or
             // once the pass decodes them all: its encode then writes only
             // the texels whose codes changed. Otherwise it writes all it
             // encodes, and the mirror with them.
-            mirror: match surface {
-                Some(_) if current || loads => TexelArguments::MIRROR_COMPARE,
-                Some(_) => TexelArguments::MIRROR_WRITE,
-                None => 0,
-            },
+            mirror: 0,
             // A pass that loads keeps the planes where it does not draw:
             // its fragments mark the tiles they reach.
-            stamp: if surface.is_some() && loads {
-                next_stamp()
-            } else {
-                0
-            },
+            stamp: 0,
             refreshes: self.plane_refreshes(id),
             staging,
         }))

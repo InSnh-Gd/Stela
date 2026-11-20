@@ -1,9 +1,10 @@
 //! Buffers, textures and texture views: Metal descriptors validated against
 //! Metal's rules and the device, then lowered to Vulkan objects.
 //!
-//! Every texture uses one image layout for its whole life
-//! (`VK_KHR_unified_image_layouts`), so lowering never schedules layout
-//! transitions. Storage modes map to memory as a discrete Mac GPU realizes
+//! Every texture uses one image layout for its whole life, which the native
+//! backend keeps itself (it moves each image to `VK_IMAGE_LAYOUT_GENERAL`
+//! once), so lowering never schedules layout transitions. Storage modes map
+//! to memory as a discrete Mac GPU realizes
 //! them: shared and managed resources live in host-visible memory, private
 //! resources in device-local memory. Memoryless textures live in device-local
 //! memory too: a pass may neither load nor store them, so no content outlives
@@ -343,11 +344,22 @@ pub fn texture(capabilities: &Capabilities, descriptor: &TextureDescriptor) -> R
         0.0,
     );
     attachment_storage(capabilities, descriptor, usage, &mut image);
+    // Integrated/unified GPUs expose cached device-local memory alongside
+    // write-combined; host image copies write tiled texels and read them back,
+    // so cached memory avoids uncached WC stalls while discrete GPUs still pick
+    // their device-local heap.
+    let preferred = if cpu_access == CpuAccess::HostImageCopy
+        && descriptor.options.cpu_cache_mode == CpuCacheMode::DefaultCache
+    {
+        M::HOST_CACHED
+    } else {
+        M::EMPTY
+    };
     Ok(TexturePlan {
         image,
         memory: MemoryRequest {
             required: M::DEVICE_LOCAL,
-            preferred: M::EMPTY,
+            preferred,
             mapped: false,
         },
         views,
@@ -624,7 +636,11 @@ fn attachment_storage(
     image: &mut ImageInfo,
 ) {
     let format = descriptor.pixel_format;
-    let attachment = capabilities.framebuffer_reads && usage.contains(TextureUsage::RENDER_TARGET);
+    let attachment = (capabilities.framebuffer_reads
+        || (!descriptor.texture_type.is_multisample()
+            && capabilities.single_sample_attachment_reads))
+        && usage.contains(TextureUsage::RENDER_TARGET)
+        && (!descriptor.texture_type.is_multisample() || capabilities.multisample_storage_images);
     let converted =
         !format.describe().encoding().is_exact() && has_texel_storage(descriptor.texture_type);
     let Some(raw) = raw_texel_format(format).filter(|_| attachment || converted) else {

@@ -654,13 +654,16 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // Framebuffer reads access each color attachment's raw texels, of
         // the attachment or, where no view of it reads them or the backend
         // may render it through a shadow (a linear image), of its copy.
-        if self.capabilities.framebuffer_reads {
+        if self.capabilities.framebuffer_reads || self.capabilities.single_sample_attachment_reads {
             for (index, color) in plan.color.iter().enumerate() {
                 let Some(color) = color else { continue };
                 let texture = self.texture_descriptor(color.view.texture)?;
                 if !texture
                     .usage
                     .contains(crate::metal::abi::TextureUsage::RENDER_TARGET)
+                    || (texture.texture_type.is_multisample()
+                        && (!self.capabilities.framebuffer_reads
+                            || !self.capabilities.multisample_storage_images))
                 {
                     continue;
                 }
@@ -893,11 +896,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             return Err(error);
         }
         let start = self.timing.since(Phase::CommitFinish, start);
-        if let Some(Detail::Commit { uploads, .. }) = self.timing.detail_mut() {
+        if let Some(Detail::Commit {
+            uploads, commands, ..
+        }) = self.timing.detail_mut()
+        {
             *uploads = recording
                 .uploads
                 .iter()
                 .map(|(_, bytes)| bytes.len() as u64)
+                .sum();
+            *commands = recording
+                .segments
+                .iter()
+                .map(|segment| segment.commands.len() as u64)
                 .sum();
         }
         let mut times = None;

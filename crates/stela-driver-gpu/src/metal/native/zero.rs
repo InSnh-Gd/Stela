@@ -90,13 +90,10 @@ impl Zeroing {
         }
     }
 
-    fn report(&mut self) {
+    fn report(&mut self, reason: &str) {
         if !self.reported {
             self.reported = true;
-            (self.log)(
-                "Stela GPU: unsupported: memory no transfer buffer can bind is not zeroed \
-                 for new resources",
-            );
+            (self.log)(reason);
         }
     }
 
@@ -121,7 +118,13 @@ impl Zeroing {
                         // SAFETY: no command used the buffer yet.
                         unsafe { device.destroy_buffer(chunk.buffer, None) };
                     }
-                    self.report();
+                    let reason = alloc::format!(
+                        "Stela GPU: unsupported: memory of type {memory_type} is not zeroed for \
+                         new resources: no {len} B fill buffer binds at {start} of {size} B \
+                         (max buffer {})",
+                        self.chunk_bytes,
+                    );
+                    self.report(&reason);
                     return;
                 }
             }
@@ -160,7 +163,11 @@ impl Zeroing {
     pub(super) fn fill(&mut self, memory: vk::DeviceMemory, offset: u64, size: u64) {
         let raw = memory.as_raw();
         if !self.chunks.contains_key(&raw) {
-            self.report();
+            let reason = alloc::format!(
+                "Stela GPU: unsupported: memory {raw:#x} has no fill buffer and is not zeroed \
+                 for new resources"
+            );
+            self.report(&reason);
             return;
         }
         self.pending.fills.push(Fill {
@@ -196,8 +203,77 @@ impl Zeroing {
     }
 }
 
-/// A transfer-destination buffer over `len` bytes of `memory` at `start`;
-/// `None` when the memory cannot hold one there.
+/// A usage fill buffers are created with. The second form names the
+/// descriptor-buffer bits, which only the 64-bit usage set carries
+/// (`VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT` 0x0004_0000 and
+/// `..._SAMPLER_...` 0x0008_0000, reached through
+/// `VkBufferUsageFlags2CreateInfoKHR`); ash 0.38 names neither.
+#[derive(Clone, Copy)]
+enum FillUsage {
+    Flags(vk::BufferUsageFlags),
+    Flags2(vk::BufferUsageFlags2KHR),
+}
+
+/// The usages tried in order. A buffer's usage picks the memory types it may
+/// bind to, and a driver that keeps dynamic-visible copies of a type for
+/// descriptor buffers leaves those copies out of every other buffer's
+/// `memoryTypeBits`: Intel's ANV adds types 4 and 5 to its 0..=2 exactly so.
+/// Memory of such a type then holds a client's descriptor buffer and no plain
+/// fill buffer can bind in it.
+const FILL_USAGES: [FillUsage; 2] = [
+    FillUsage::Flags(vk::BufferUsageFlags::TRANSFER_DST),
+    FillUsage::Flags2(vk::BufferUsageFlags2KHR::from_raw(
+        vk::BufferUsageFlags2KHR::TRANSFER_DST.as_raw() | 0x000c_0000,
+    )),
+];
+
+/// A buffer of `len` bytes created for `usage`; `None` when the device
+/// refuses it.
+fn create_fill_buffer(device: &ash::Device, usage: FillUsage, len: u64) -> Option<vk::Buffer> {
+    match usage {
+        FillUsage::Flags(usage) => {
+            let info = vk::BufferCreateInfo::default()
+                .size(len)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: the create info outlives the call.
+            unsafe { device.create_buffer(&info, None) }.ok()
+        }
+        FillUsage::Flags2(usage) => {
+            let mut usage = vk::BufferUsageFlags2CreateInfoKHR::default().usage(usage);
+            let info = vk::BufferCreateInfo::default()
+                .size(len)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: the create info and its chain outlive the call.
+            let info = info.push_next(&mut usage);
+            unsafe { device.create_buffer(&info, None) }.ok()
+        }
+    }
+}
+
+/// The bitmask of memory types that accept a `TRANSFER_DST` fill buffer.
+/// Intel Xe2 marks compressed memory types image-only, so buffers cannot bind
+/// to them and unmapped blocks using them cannot be zeroed via fill buffers.
+pub(super) fn fillable_memory_types(device: &ash::Device) -> u32 {
+    let mut bits = 0;
+    for usage in FILL_USAGES {
+        let Some(buffer) = create_fill_buffer(device, usage, FILL_ALIGN) else {
+            continue;
+        };
+        // SAFETY: the buffer was just created.
+        let needs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        if needs.size <= FILL_ALIGN {
+            bits |= needs.memory_type_bits;
+        }
+        // SAFETY: no command used the buffer.
+        unsafe { device.destroy_buffer(buffer, None) };
+    }
+    bits
+}
+
+/// A fill buffer over `len` bytes of `memory` at `start`, of the first
+/// [`FILL_USAGES`] the memory takes; `None` when it takes none there.
 fn fill_buffer(
     device: &ash::Device,
     memory: vk::DeviceMemory,
@@ -205,23 +281,22 @@ fn fill_buffer(
     start: u64,
     len: u64,
 ) -> Option<vk::Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(len)
-        .usage(vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    // SAFETY: the create info outlives the call.
-    let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
-    // SAFETY: the buffer was just created.
-    let needs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let fits = needs.memory_type_bits & 1 << memory_type != 0
-        && start.is_multiple_of(needs.alignment.max(1))
-        && needs.size <= len;
-    // SAFETY: the buffer is unbound, and `start + len` lies in the memory.
-    if fits && unsafe { device.bind_buffer_memory(buffer, memory, start) }.is_ok() {
-        return Some(buffer);
+    for usage in FILL_USAGES {
+        let Some(buffer) = create_fill_buffer(device, usage, len) else {
+            continue;
+        };
+        // SAFETY: the buffer was just created.
+        let needs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let fits = needs.memory_type_bits & 1 << memory_type != 0
+            && start.is_multiple_of(needs.alignment.max(1))
+            && needs.size <= len;
+        // SAFETY: the buffer is unbound, and `start + len` lies in the memory.
+        if fits && unsafe { device.bind_buffer_memory(buffer, memory, start) }.is_ok() {
+            return Some(buffer);
+        }
+        // SAFETY: no command used the buffer.
+        unsafe { device.destroy_buffer(buffer, None) };
     }
-    // SAFETY: no command used the buffer.
-    unsafe { device.destroy_buffer(buffer, None) };
     None
 }
 

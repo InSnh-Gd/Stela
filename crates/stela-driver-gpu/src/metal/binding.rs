@@ -1065,18 +1065,34 @@ pub struct HeapLayout {
     pub counts: [u32; 5],
 }
 
+/// The most descriptors of one kind the heap takes, however high the
+/// driver's update-after-bind limits are.
+///
+/// A limit is the capacity of the driver's own descriptor heap, not a count
+/// a pool can hold: Intel's Vulkan driver on Xe2+ keeps direct descriptors of
+/// 64 bytes in a descriptor heap it maps 2 GiB of, so it advertises 2^25
+/// images — a pool of that many is the heap itself, and with the alignment
+/// the driver adds per set it does not fit, failing with
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` before any descriptor is written. NVIDIA's
+/// driver advertises a million here, which is where this cap comes from, so
+/// the cap does not change what it offers.
+pub const MAX_HEAP_DESCRIPTORS: u32 = 1 << 20;
+
 impl HeapLayout {
     pub fn new(limits: &Limits) -> Self {
         let sampled = limits
             .max_descriptor_set_update_after_bind_sampled_images
-            .min(limits.max_per_stage_update_after_bind_sampled_images);
+            .min(limits.max_per_stage_update_after_bind_sampled_images)
+            .min(MAX_HEAP_DESCRIPTORS);
         let storage = limits
             .max_descriptor_set_update_after_bind_storage_images
-            .min(limits.max_per_stage_update_after_bind_storage_images);
+            .min(limits.max_per_stage_update_after_bind_storage_images)
+            .min(MAX_HEAP_DESCRIPTORS);
         let samplers = limits
             .max_descriptor_set_update_after_bind_samplers
             .min(limits.max_per_stage_update_after_bind_samplers)
-            .min(limits.max_sampler_allocation_count);
+            .min(limits.max_sampler_allocation_count)
+            .min(MAX_HEAP_DESCRIPTORS);
         // Storage indices leave the high half's flag and level count bits free.
         let storage = storage.min(ResourceId::MAX_STORAGE);
         Self {

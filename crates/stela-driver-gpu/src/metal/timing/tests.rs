@@ -42,6 +42,7 @@ fn a_call_counts_its_own_phases_only() {
         Detail::Commit {
             stream: 1,
             uploads: 2,
+            commands: 3,
         },
     );
     at(200);
@@ -54,6 +55,42 @@ fn a_call_counts_its_own_phases_only() {
     assert_eq!(call.detail, Detail::None);
     assert_eq!(call.longest_phase(), ("alloc", 45));
     assert_eq!(recorder.take(), None);
+}
+
+#[test]
+fn a_texture_move_counts_its_read_its_pack_and_its_copy() {
+    let mut recorder = Recorder::default();
+    recorder.set_clock(clock);
+    at(10);
+    recorder.begin(Timed::ReplaceRegion);
+    at(20);
+    let start = recorder.since(Phase::RegionRead, 10);
+    at(40);
+    let start = recorder.since(Phase::RegionPack, start);
+    at(50);
+    recorder.since(Phase::RegionCopy, start);
+    at(60);
+    let call = recorder.take().expect("a timed call");
+    assert_eq!(call.operation, Timed::ReplaceRegion);
+    assert_eq!(&call.phases[..3], &[10, 20, 10]);
+    assert_eq!(call.longest_phase(), ("pack", 20));
+    assert_eq!(call.other(), 10);
+}
+
+#[test]
+fn a_commits_detail_names_its_stream_its_uploads_and_its_commands() {
+    let mut call = CallPhases::new(Timed::Commit);
+    call.total = 1_000;
+    call.detail = Detail::Commit {
+        stream: 20_080,
+        uploads: 98_232,
+        commands: 417,
+    };
+    assert_eq!(
+        call.slow_line(1_000_000).to_string(),
+        "GPU SLOW commit took_us=1000 most=other/1000us other_us=1000 \
+         stream=20080 uploads=98232 commands=417"
+    );
 }
 
 #[test]
