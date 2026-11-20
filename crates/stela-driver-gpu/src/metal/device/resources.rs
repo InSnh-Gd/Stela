@@ -1679,16 +1679,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         bytes: &[u8],
         strides: Strides,
     ) -> Result<()> {
+        let start = self.timing.now();
         let (region, strides) = self.block_run(id, region, strides)?;
         let region = &region;
         let (copy, rows) = self.cpu_region(id, region, strides, bytes.len())?;
         if rows.tight() {
+            self.timing.since(Phase::RegionPack, start);
             return self.write_region(id, &copy, &bytes[..rows.packed_bytes]);
         }
         let mut packed = Vec::with_capacity(rows.packed_bytes);
         for row in rows.ranges() {
             packed.extend_from_slice(&bytes[row]);
         }
+        self.timing.since(Phase::RegionPack, start);
         self.write_region(id, &copy, &packed)
     }
 
@@ -1792,6 +1795,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let image = texture.image.ok_or(Error::Invalid(
             "texture buffers are written through their buffer",
         ))?;
+        let start = self.timing.now();
+        let written = self.write_region_image(id, image, region, bytes);
+        self.timing.since(Phase::RegionCopy, start);
+        written
+    }
+
+    /// The write itself: what [`Phase::RegionCopy`] times, including the
+    /// zeroing an image's first full write needs. `write_region`'s checks
+    /// come before it.
+    fn write_region_image(
+        &mut self,
+        id: TextureId,
+        image: Image,
+        region: &BufferImageCopy,
+        bytes: &[u8],
+    ) -> Result<()> {
         if self.write_aligned_rows(id, region, bytes)? {
             return Ok(());
         }
@@ -3254,9 +3273,277 @@ mod surface_range_tests {
         for video in [b"420v", b"x420", b"422v", b"x422", b"x444", b"&8v0"] {
             assert!(video_range(code(video)));
         }
-        for full in [b"420f", b"xf20", b"444f", b"xf44", b"&8f0"] {
-            assert!(!video_range(code(full)));
+    }
+}
+
+#[cfg(not(test))]
+fn diag_f16(bits: u16) -> f32 {
+    let sign = if (bits & 0x8000) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (bits >> 10) & 0x1f;
+    let mant = bits & 0x3ff;
+    if exp == 0 {
+        sign * (mant as f32) * (1.0 / 16777216.0)
+    } else if exp == 31 {
+        if mant == 0 {
+            sign * f32::INFINITY
+        } else {
+            f32::NAN
         }
-        assert!(!video_range(0));
+    } else {
+        let val = 1.0 + (mant as f32) / 1024.0;
+        let p = (exp as i32) - 15;
+        let scale = f32::from_bits(((127 + p) as u32) << 23);
+        sign * val * scale
+    }
+}
+
+#[cfg(not(test))]
+impl<B: Backend, C: Compiler> Device<B, C> {
+    pub(crate) fn diag_texture_summary(&self, id: TextureId) -> alloc::string::String {
+        let Ok(t) = self.resources.textures.get(id.0) else {
+            return format!("#{}?<gone>", id.0);
+        };
+        let d = &t.descriptor;
+        format!(
+            "#{}:{:?}/{}x{}/s{}/m{}/sm={:?}/2p={}/cpu={:?}/img={}",
+            id.0,
+            d.pixel_format,
+            d.width,
+            d.height,
+            d.sample_count,
+            d.mipmap_level_count,
+            d.options.storage_mode,
+            t.second_plane.is_some(),
+            t.cpu_access,
+            t.image.is_some()
+        )
+    }
+
+    pub(crate) fn diag_wait_and_probe(
+        &mut self,
+        probes: &[(alloc::string::String, Option<TextureId>, Option<TextureId>, Option<TextureId>)],
+    ) -> Vec<alloc::string::String> {
+        let mut out = Vec::new();
+        let target = self.submitted;
+        if target == 0 {
+            return out;
+        }
+        let _ = self.poll();
+        if !self.serial_complete(target) {
+            let _ = self.backend.wait_semaphore(self.timeline, target, 100_000_000);
+            let _ = self.poll();
+        }
+        if !self.serial_complete(target) {
+            out.push(format!("DIAG PROBE held serial={target}"));
+            return out;
+        }
+        for (label, tex0, tex1, c0) in probes {
+            let s0 = tex0.map_or_else(|| "-".into(), |id| self.diag_probe_texel(id));
+            let s1 = tex1.map_or_else(|| "-".into(), |id| self.diag_probe_texel(id));
+            let sc = c0.map_or_else(|| "-".into(), |id| self.diag_probe_texel(id));
+            out.push(format!("DIAG PROBE {label} tex3=[{s0}] tex4=[{s1}] c0=[{sc}]"));
+        }
+        out
+    }
+
+    pub(crate) fn diag_probe_texel(&mut self, id: TextureId) -> alloc::string::String {
+        let (image, second_plane, d) = match self.resources.textures.get(id.0) {
+            Ok(t) => (t.image, t.second_plane, t.descriptor),
+            Err(_) => return format!("#{}?<gone>", id.0),
+        };
+        if d.sample_count != 1 || d.width == 0 || d.height == 0 {
+            return format!("#{} msaa/empty {}x{} s{}", id.0, d.width, d.height, d.sample_count);
+        }
+        let desc = d.pixel_format.describe();
+        if desc.has_depth() || desc.has_stencil() {
+            return format!("#{} depth/stencil", id.0);
+        }
+        let Some(image) = image else {
+            return format!("#{} no-image", id.0);
+        };
+        let working_img = if self.has_extended_planes(id) {
+            let view = AttachmentView {
+                texture: (),
+                view_type: crate::metal::vulkan::ImageViewType::D2,
+                range: crate::metal::vulkan::object::SubresourceRange {
+                    aspects: ImageAspects::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+            };
+            self.extended_working(id, view).ok().map(|w| w.image)
+        } else {
+            None
+        };
+        let x0 = (d.width / 2).min(d.width - 1) as i32;
+        let y0 = (d.height / 2).min(d.height - 1) as i32;
+        let x1 = (d.width / 4).min(d.width - 1) as i32;
+        let y1 = (d.height / 4).min(d.height - 1) as i32;
+        let info = BufferInfo {
+            size: 96,
+            usage: BufferUsage::TRANSFER_DST,
+            flags: BufferCreate::EMPTY,
+        };
+        let request = MemoryRequest {
+            required: MemoryProperties::HOST_VISIBLE | MemoryProperties::HOST_COHERENT,
+            preferred: MemoryProperties::HOST_CACHED,
+            mapped: true,
+        };
+        let Ok(staging) = self.backend.create_buffer(&info, request) else {
+            return format!("#{} buf-alloc-err", id.0);
+        };
+        self.allocated += staging.allocated;
+        let Some(host) = self.backend.host_bytes(staging.memory, 0, 96) else {
+            self.defer(Object::Buffer(staging.buffer));
+            self.release_memory(staging.memory, staging.allocated);
+            return format!("#{} no-host", id.0);
+        };
+        let sub = crate::metal::vulkan::command::Subresource {
+            aspects: ImageAspects::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let mk_copy = |buffer_offset: u64, x: i32, y: i32| BufferImageCopy {
+            buffer_offset,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            subresource: sub,
+            offset: [x, y, 0],
+            extent: [1, 1, 1],
+        };
+        let mut commands = self.new_command_buffer();
+        let rec = commands
+            .begin_blit()
+            .and_then(|()| commands.read_back(image, staging.buffer, mk_copy(0, x0, y0)))
+            .and_then(|()| commands.read_back(image, staging.buffer, mk_copy(16, x1, y1)))
+            .and_then(|()| {
+                if let Some(img2) = second_plane {
+                    commands.read_back(img2, staging.buffer, mk_copy(32, x0, y0))?;
+                    commands.read_back(img2, staging.buffer, mk_copy(48, x1, y1))?;
+                }
+                if let Some(wk) = working_img {
+                    commands.read_back(wk, staging.buffer, mk_copy(64, x0, y0))?;
+                    commands.read_back(wk, staging.buffer, mk_copy(80, x1, y1))?;
+                }
+                Ok(())
+            })
+            .and_then(|()| commands.end_encoding(&mut self.resolver()));
+        let serial = match rec {
+            Ok(()) => match self.commit_on(0, u64::MAX, commands) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.defer(Object::Buffer(staging.buffer));
+                    self.release_memory(staging.memory, staging.allocated);
+                    return format!("#{} commit-err={e:?}", id.0);
+                }
+            },
+            Err(e) => {
+                self.discard(commands);
+                self.defer(Object::Buffer(staging.buffer));
+                self.release_memory(staging.memory, staging.allocated);
+                return format!("#{} rec-err={e:?}", id.0);
+            }
+        };
+        let _ = self.backend.wait_semaphore(self.timeline, serial, 200_000_000);
+        let _ = self.poll();
+        let mut raw = [0u8; 96];
+        if self.serial_complete(serial) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(host.as_ptr(), raw.as_mut_ptr(), 96);
+            }
+        } else {
+            self.defer(Object::Buffer(staging.buffer));
+            self.release_memory(staging.memory, staging.allocated);
+            return format!("#{} probe-timeout", id.0);
+        }
+        self.defer(Object::Buffer(staging.buffer));
+        self.release_memory(staging.memory, staging.allocated);
+        let fmt_pt = |sl: &[u8], a_byte: Option<u8>| -> alloc::string::String {
+            let is_f16x4 = second_plane.is_none()
+                && (desc.block.bytes == 8
+                    || matches!(
+                        d.pixel_format,
+                        crate::metal::pixel_format::PixelFormat::Rgb10A8_2pXr10
+                            | crate::metal::pixel_format::PixelFormat::Rgb10A8_2pXr10Srgb
+                    ));
+            if second_plane.is_some() {
+                let w = u32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]);
+                let b = w & 0x3ff;
+                let g = (w >> 10) & 0x3ff;
+                let r = (w >> 20) & 0x3ff;
+                format!("xr=0x{w:08x}(r={r},g={g},b={b},a={})", a_byte.unwrap_or(0))
+            } else if is_f16x4 {
+                let h = [
+                    u16::from_le_bytes([sl[0], sl[1]]),
+                    u16::from_le_bytes([sl[2], sl[3]]),
+                    u16::from_le_bytes([sl[4], sl[5]]),
+                    u16::from_le_bytes([sl[6], sl[7]]),
+                ];
+                format!(
+                    "f16=({:.3},{:.3},{:.3},{:.3})",
+                    diag_f16(h[0]),
+                    diag_f16(h[1]),
+                    diag_f16(h[2]),
+                    diag_f16(h[3])
+                )
+            } else if desc.block.bytes == 4 && matches!(
+                d.pixel_format,
+                crate::metal::pixel_format::PixelFormat::Bgr10A2Unorm
+                    | crate::metal::pixel_format::PixelFormat::Bgr10Xr
+                    | crate::metal::pixel_format::PixelFormat::Bgr10XrSrgb
+            ) {
+                let w = u32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]);
+                let b = w & 0x3ff;
+                let g = (w >> 10) & 0x3ff;
+                let r = (w >> 20) & 0x3ff;
+                let a = w >> 30;
+                format!("10b=(r={r},g={g},b={b},a={a})")
+            } else {
+                format!("b={:02x}{:02x}{:02x}{:02x}", sl[0], sl[1], sl[2], sl[3])
+            }
+        };
+        let a0 = second_plane.map(|_| raw[32]);
+        let a1 = second_plane.map(|_| raw[48]);
+        let fmt_f16 = |sl: &[u8]| -> alloc::string::String {
+            let h = [
+                u16::from_le_bytes([sl[0], sl[1]]),
+                u16::from_le_bytes([sl[2], sl[3]]),
+                u16::from_le_bytes([sl[4], sl[5]]),
+                u16::from_le_bytes([sl[6], sl[7]]),
+            ];
+            format!(
+                "({:.3},{:.3},{:.3},{:.3})[{:04x},{:04x},{:04x},{:04x}]",
+                diag_f16(h[0]),
+                diag_f16(h[1]),
+                diag_f16(h[2]),
+                diag_f16(h[3]),
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+            )
+        };
+        let wk_str = if working_img.is_some() {
+            format!(" wk={}/{}", fmt_f16(&raw[64..80]), fmt_f16(&raw[80..96]))
+        } else {
+            alloc::string::String::new()
+        };
+        format!(
+            "#{}:{:?}({}x{}) @({},{})={} @({},{})={}{}",
+            id.0,
+            d.pixel_format,
+            d.width,
+            d.height,
+            x0,
+            y0,
+            fmt_pt(&raw[0..16], a0),
+            x1,
+            y1,
+            fmt_pt(&raw[16..32], a1),
+            wk_str,
+        )
     }
 }

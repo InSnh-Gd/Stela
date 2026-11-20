@@ -29,6 +29,7 @@ use super::{
     error::Error,
     indirect::IndirectCommandBufferId,
     shader::Compiler,
+    timing::{Phase, Timed},
     vulkan::backend::{Backend, PreparedImport},
 };
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, vec::Vec};
@@ -381,6 +382,36 @@ pub struct Service<B: Backend, C: Compiler> {
     read_back_started: Option<StartedReadBack>,
     reopen: Option<Reopen<B, C>>,
     prepare: Option<Prepare<B, C>>,
+    #[cfg(not(test))]
+    diag_pipelines: BTreeMap<u32, (String, String, String)>,
+    #[cfg(not(test))]
+    diag_pass_c0: Option<(TextureId, String)>,
+    #[cfg(not(test))]
+    diag_pass_c1: Option<(TextureId, String)>,
+    #[cfg(not(test))]
+    diag_bound_pipeline: Option<u32>,
+    #[cfg(not(test))]
+    diag_frag_tex: BTreeMap<u32, TextureId>,
+    #[cfg(not(test))]
+    diag_frag_buf: BTreeMap<u32, String>,
+    #[cfg(not(test))]
+    diag_draw_count: u32,
+    #[cfg(not(test))]
+    diag_probe_queue: Vec<(String, Option<TextureId>, Option<TextureId>, Option<TextureId>)>,
+    #[cfg(not(test))]
+    diag_probe_count: u32,
+    #[cfg(not(test))]
+    diag_wall_seen: bool,
+    #[cfg(not(test))]
+    diag_wall_probes: u32,
+    #[cfg(not(test))]
+    diag_vp: String,
+    #[cfg(not(test))]
+    diag_sc: String,
+    #[cfg(not(test))]
+    diag_cull: String,
+    #[cfg(not(test))]
+    diag_ds: String,
 }
 
 impl<B: Backend, C: Compiler> Service<B, C> {
@@ -406,6 +437,36 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             read_back_started: None,
             reopen: None,
             prepare: None,
+            #[cfg(not(test))]
+            diag_pipelines: BTreeMap::new(),
+            #[cfg(not(test))]
+            diag_pass_c0: None,
+            #[cfg(not(test))]
+            diag_pass_c1: None,
+            #[cfg(not(test))]
+            diag_bound_pipeline: None,
+            #[cfg(not(test))]
+            diag_frag_tex: BTreeMap::new(),
+            #[cfg(not(test))]
+            diag_frag_buf: BTreeMap::new(),
+            #[cfg(not(test))]
+            diag_draw_count: 0,
+            #[cfg(not(test))]
+            diag_probe_queue: Vec::new(),
+            #[cfg(not(test))]
+            diag_probe_count: 0,
+            #[cfg(not(test))]
+            diag_wall_seen: false,
+            #[cfg(not(test))]
+            diag_wall_probes: 0,
+            #[cfg(not(test))]
+            diag_vp: String::new(),
+            #[cfg(not(test))]
+            diag_sc: String::new(),
+            #[cfg(not(test))]
+            diag_cull: String::new(),
+            #[cfg(not(test))]
+            diag_ds: String::new(),
         }
     }
 
@@ -686,7 +747,33 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         match operation {
             Operation::Negotiate => self.negotiate(&mut call),
             Operation::Capabilities => {
-                let block = self.device.capabilities().block()?;
+                let caps = self.device.capabilities();
+                #[cfg(not(test))]
+                {
+                    use crate::metal::pixel_format::PixelFormat as P;
+                    self.refused.push(format!(
+                        "DIAG CAPS families={:?} fb_reads={} single_reads={} rw={:?} arg={:?} \
+                         f32_flt={} lin_row={} surf_row={} Bgra10Xr={:?} Rgba16F={:?} \
+                         Xr10A8={:?} Bgra8={:?} gaps={:?}",
+                        caps.families(),
+                        caps.framebuffer_reads,
+                        caps.single_sample_attachment_reads,
+                        caps.read_write_texture_tier,
+                        caps.argument_buffers_tier,
+                        caps.supports_32bit_float_filtering,
+                        caps.linear_texture_alignments().0,
+                        caps.surface_row_alignment(),
+                        caps.format(P::Bgra10Xr),
+                        caps.format(P::Rgba16Float),
+                        caps.format(P::Rgb10A8_2pXr10),
+                        caps.format(P::Bgra8Unorm),
+                        caps.gaps()
+                            .iter()
+                            .map(|g| g.capability.as_str())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                let block = caps.block()?;
                 call.reply(&*block)
             }
             Operation::Release => {
@@ -930,15 +1017,19 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// Releases the object `handle` names. When the device refuses, for an
     /// object others still depend on, the handle stays valid.
     fn release(&mut self, connection: NonZeroU64, handle: u64) -> Result<(), Fault> {
+        self.device.timing().begin(Timed::Release);
+        let start = self.device.timing().now();
         let epoch = self.epoch;
         let handle = ObjectHandle::decode(handle).ok_or(Fault::STALE)?;
         let held = self.connection(connection)?;
         let entry = held.objects.get(connection, epoch, handle)?;
         let (object, serial) = (entry.object, entry.serial);
+        let start = self.device.timing().since(Phase::ReleaseFind, start);
         self.destroy(connection, object, serial)?;
         let held = self.connection(connection)?;
         let entry = held.objects.remove(connection, epoch, handle)?;
         held.allocated -= entry.bytes;
+        self.device.timing().since(Phase::ReleaseDrop, start);
         Ok(())
     }
 

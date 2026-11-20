@@ -78,8 +78,44 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             archives: self.archives(connection, &mut *memory, &request.archives)?,
         };
         self.noted = Some(self.describe_render_pipeline(&pipeline));
-        let pipeline = self.device.new_render_pipeline(&pipeline)?;
-        self.adopt_render_pipeline(call, pipeline)
+        let created = self.device.new_render_pipeline(&pipeline)?;
+        #[cfg(not(test))]
+        {
+            let entry = |id: FunctionId| {
+                String::from(self.device.function_entry(id).unwrap_or("?"))
+            };
+            let mut cinfo = String::new();
+            for (i, c) in pipeline.targets.color_attachments.iter().enumerate() {
+                if c.pixel_format.is_some() {
+                    if !cinfo.is_empty() {
+                        cinfo.push(' ');
+                    }
+                    cinfo.push_str(&format!("{i}:b{}w{:x}", u8::from(c.blending_enabled), c.write_mask.bits()));
+                    if c.blending_enabled {
+                        cinfo.push_str(&format!(
+                            "({:?}/{:?}+{:?},{:?}/{:?}+{:?})",
+                            c.source_rgb_blend_factor,
+                            c.destination_rgb_blend_factor,
+                            c.rgb_blend_operation,
+                            c.source_alpha_blend_factor,
+                            c.destination_alpha_blend_factor,
+                            c.alpha_blend_operation
+                        ));
+                    }
+                }
+            }
+            self.diag_pipelines.insert(
+                created.0,
+                (
+                    entry(pipeline.vertex_function),
+                    pipeline
+                        .fragment_function
+                        .map_or_else(|| "-".into(), entry),
+                    cinfo,
+                ),
+            );
+        }
+        self.adopt_render_pipeline(call, created)
     }
 
     /// A render pipeline's functions and vertex fetch, for the platform's
@@ -125,6 +161,26 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 );
             }
             text.push_str(" ]");
+        }
+        #[cfg(not(test))]
+        {
+            text.push_str(" colors=[");
+            for (index, color) in pipeline.targets.color_attachments.iter().enumerate() {
+                if let Some(fmt) = color.pixel_format {
+                    let _ = write!(
+                        text,
+                        " {index}:{fmt:?}/b={}/w={:?}",
+                        color.blending_enabled, color.write_mask
+                    );
+                }
+            }
+            let _ = write!(
+                text,
+                " ] samples={} depth={:?} stencil={:?}",
+                pipeline.targets.raster_sample_count,
+                pipeline.targets.depth_attachment_pixel_format,
+                pipeline.targets.stencil_attachment_pixel_format
+            );
         }
         text
     }

@@ -111,15 +111,43 @@ pub(super) fn requirements(requirements: &vk::MemoryRequirements) -> Requirement
 /// The memory types among `types` that satisfy `request`, those with its
 /// preferred properties first.
 pub(super) fn memory_candidates(memory: &Memory, types: u32, request: MemoryRequest) -> Vec<u32> {
+    zeroable_memory_candidates(memory, types, request, u32::MAX)
+}
+
+/// Like [`memory_candidates`], putting `fillable` memory types ahead of
+/// unzeroable (e.g. image-only compressed) types when `request.mapped` is false.
+pub(super) fn zeroable_memory_candidates(
+    memory: &Memory,
+    types: u32,
+    request: MemoryRequest,
+    fillable: u32,
+) -> Vec<u32> {
     let mut required = request.required;
     if request.mapped {
         required = required.union(MemoryProperties::HOST_VISIBLE);
     }
     let properties = |index: u32| memory.types[index as usize].properties;
-    let (preferred, others): (Vec<u32>, Vec<u32>) = (0..memory.types.len() as u32)
+    let matches: Vec<u32> = (0..memory.types.len() as u32)
         .filter(|&index| types & (1 << index) != 0 && properties(index).contains(required))
+        .collect();
+    let (preferred, others): (Vec<u32>, Vec<u32>) = matches
+        .into_iter()
         .partition(|&index| properties(index).contains(request.preferred));
-    preferred.into_iter().chain(others).collect()
+    if request.mapped {
+        return preferred.into_iter().chain(others).collect();
+    }
+    let split = |list: Vec<u32>| {
+        list.into_iter()
+            .partition::<Vec<u32>, _>(|&index| fillable & (1 << index) != 0)
+    };
+    let (pref_ok, pref_rest) = split(preferred);
+    let (other_ok, other_rest) = split(others);
+    pref_ok
+        .into_iter()
+        .chain(other_ok)
+        .chain(pref_rest)
+        .chain(other_rest)
+        .collect()
 }
 
 /// The heap's bindings, one array per [`HeapArray`] in binding order.
@@ -308,6 +336,11 @@ fn stage(stage: ShaderStages, nir: &NirStage) -> vk::PipelineShaderStageCreateIn
     info
 }
 
+#[cfg(not(test))]
+pub(super) fn diag_dump_tag(_info: &GraphicsPipelineInfo) -> Option<&'static str> {
+    None
+}
+
 /// What creating a pipeline from `source` asks.
 fn create_flags(source: PipelineSource) -> vk::PipelineCreateFlags {
     match source {
@@ -485,7 +518,13 @@ pub(super) fn graphics_pipeline<T>(
     if info.topology == PrimitiveTopology::PatchList {
         create = create.tessellation_state(&tessellation);
     }
-    let source = create_flags(info.source);
+    let mut source = create_flags(info.source);
+    #[cfg(not(test))]
+    if let Some(tag) = diag_dump_tag(info) {
+        if tag == "GEN" {
+            source |= vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR;
+        }
+    }
     create = create.flags(source);
     let mut flags = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(indirect_flags(source));
     if info.indirect_bindable {

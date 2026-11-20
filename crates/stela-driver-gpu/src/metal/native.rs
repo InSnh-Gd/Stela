@@ -31,7 +31,7 @@ mod tests;
 mod zero;
 
 use super::{
-    binding::{HEAP_SET, HeapLayout, NULL_DESCRIPTOR, PushConstants},
+    binding::{HEAP_SET, HeapLayout, MAX_HEAP_DESCRIPTORS, NULL_DESCRIPTOR, PushConstants},
     command_buffer::Segment,
     error::{Error, Result, ensure},
     vulkan::{
@@ -554,6 +554,8 @@ pub struct NativeBackend {
     /// What new resources take of memory used before, which the host or
     /// the next submission zeroes first.
     zeroing: zero::Zeroing,
+    /// Memory types that can host a `TRANSFER_DST` fill buffer for zeroing.
+    fillable_types: u32,
     /// Orders sparse binds between command buffers: before a segment's
     /// binds the queue signals an odd value, and the binds signal the next.
     bind_timeline: vk::Semaphore,
@@ -769,6 +771,7 @@ impl NativeBackend {
         }
         let memories = memory::Memories::new(snapshot.limits.buffer_image_granularity);
         let zeroing = zero::Zeroing::new(snapshot.limits.max_buffer_size, loader.log);
+        let fillable_types = zero::fillable_memory_types(&device);
         let exporter: Arc<dyn MemoryExporter> = Arc::from(exporter);
         let outside = Arc::new(NativeOutside::new(
             device.clone(),
@@ -807,6 +810,7 @@ impl NativeBackend {
             outstanding: None,
             new_images: Vec::new(),
             zeroing,
+            fillable_types,
             bind_timeline: vk::Semaphore::null(),
             bind_value: 0,
             accumulate: vk::Pipeline::null(),
@@ -940,6 +944,15 @@ impl NativeBackend {
                 features.sparse_residency_samples = SampleCounts::EMPTY;
                 features.sparse_residency_aliased = false;
             }
+            let limits = &snapshot.limits;
+            log(&format!(
+                "Vulkan device {index}: its update-after-bind limits are {} sampled images, {} \
+                 storage images and {} samplers, of which the heap takes at most {} each",
+                limits.max_descriptor_set_update_after_bind_sampled_images,
+                limits.max_descriptor_set_update_after_bind_storage_images,
+                limits.max_descriptor_set_update_after_bind_samplers,
+                MAX_HEAP_DESCRIPTORS,
+            ));
             Some((physical, extensions, snapshot, family as u32))
         });
         if selected.is_none() {
@@ -1028,7 +1041,12 @@ impl NativeBackend {
     /// zeroed: a heap's resources are not, but none may read what another
     /// client left in the memory before.
     fn allocate(&mut self, size: u64, request: MemoryRequest, types: u32) -> Result<Memory> {
-        let candidates = objects::memory_candidates(&self.snapshot.memory, types, request);
+        let candidates = objects::zeroable_memory_candidates(
+            &self.snapshot.memory,
+            types,
+            request,
+            self.fillable_types,
+        );
         ensure(!candidates.is_empty(), "no memory type suits the resource")?;
         let mut source = memory::Allocator {
             device: &self.device,
@@ -1204,7 +1222,12 @@ impl NativeBackend {
     ) -> Vec<Candidate> {
         let memory = &self.snapshot.memory;
         let atom = self.snapshot.limits.non_coherent_atom_size.max(1);
-        objects::memory_candidates(memory, requirements.memory_type_bits, request)
+        objects::zeroable_memory_candidates(
+            memory,
+            requirements.memory_type_bits,
+            request,
+            self.fillable_types,
+        )
             .into_iter()
             .map(|index| {
                 let properties = memory.types[index as usize].properties;
@@ -1792,6 +1815,63 @@ impl NativeBackend {
                 line.push_str(&format!(" {name}={}", value(statistic)));
             }
             log(&line);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn diag_dump_executables(&self, pipeline: vk::Pipeline, info: &GraphicsPipelineInfo) {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        unsafe extern "C" {
+            fn write(fd: i32, buffer: *const u8, size: usize) -> isize;
+        }
+        let emit = |s: &str| {
+            let mut off = 0;
+            let bytes = s.as_bytes();
+            while off < bytes.len() {
+                let n = (bytes.len() - off).min(2048);
+                unsafe {
+                    write(2, bytes[off..].as_ptr(), n);
+                }
+                off += n;
+            }
+        };
+        static DUMPED: AtomicU32 = AtomicU32::new(0);
+        let Some(tag) = objects::diag_dump_tag(info) else {
+            return;
+        };
+        if tag != "GEN" || DUMPED.fetch_add(1, Ordering::Relaxed) >= 4 {
+            return;
+        }
+        let Some(Executables { fns, .. }) = &self.fns.executables else {
+            return;
+        };
+        let pinfo = vk::PipelineInfoKHR::default().pipeline(pipeline);
+        let Ok(executables) = (unsafe { fns.get_pipeline_executable_properties(&pinfo) }) else {
+            return;
+        };
+        for (index, executable) in executables.iter().enumerate() {
+            let exec_name = executable
+                .name_as_c_str()
+                .map_or("?", |n| n.to_str().unwrap_or("?"));
+            let einfo = vk::PipelineExecutableInfoKHR::default()
+                .pipeline(pipeline)
+                .executable_index(index as u32);
+            let Ok(stats) = (unsafe { fns.get_pipeline_executable_statistics(&einfo) }) else {
+                continue;
+            };
+            let mut line = format!("DIAG STAT GEN [{exec_name}]:");
+            for s in &stats {
+                let name = s.name_as_c_str().map_or("?", |n| n.to_str().unwrap_or("?"));
+                let val = match s.format {
+                    vk::PipelineExecutableStatisticFormatKHR::BOOL32 => unsafe { s.value.b32 as i64 },
+                    vk::PipelineExecutableStatisticFormatKHR::INT64 => unsafe { s.value.i64 },
+                    vk::PipelineExecutableStatisticFormatKHR::UINT64 => unsafe { s.value.u64 as i64 },
+                    _ => 0,
+                };
+                line.push_str(&format!(" {name}={val}"));
+            }
+            line.push('\n');
+            emit(&line);
         }
     }
 
@@ -2801,6 +2881,8 @@ impl Backend for NativeBackend {
         if let Some(created) = self.deferred_creation(deferral::Wanted::Graphics(info)) {
             let pipeline = created?;
             self.report_executables(pipeline);
+            #[cfg(not(test))]
+            self.diag_dump_executables(pipeline, info);
             return Ok(Pipeline(raw(pipeline)));
         }
         let started = (self.ticks)();
@@ -2836,6 +2918,8 @@ impl Backend for NativeBackend {
         deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
         created.map(|pipeline| {
             self.report_executables(pipeline);
+            #[cfg(not(test))]
+            self.diag_dump_executables(pipeline, info);
             Pipeline(raw(pipeline))
         })
     }

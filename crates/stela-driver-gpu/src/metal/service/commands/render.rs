@@ -64,10 +64,85 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     }
                     return Err(error.into());
                 }
+                #[cfg(not(test))]
+                {
+                    use crate::metal::pixel_format::PixelFormat as P;
+                    self.diag_bound_pipeline = None;
+                    self.diag_vp = "default".into();
+                    self.diag_sc = "default".into();
+                    self.diag_cull = "None".into();
+                    self.diag_ds = "none".into();
+                    self.diag_frag_tex.clear();
+                    self.diag_frag_buf.clear();
+                    self.diag_pass_c0 = request.color_attachments[0].as_ref().map(|att| {
+                        let s = format!(
+                            "{} load={:?} store={:?} surf={}",
+                            self.device.diag_texture_summary(att.texture),
+                            att.load_action,
+                            att.store_action,
+                            att.surface.is_some()
+                        );
+                        (att.texture, s)
+                    });
+                    self.diag_pass_c1 = request.color_attachments[1].as_ref().map(|att| {
+                        let s = format!(
+                            "{} load={:?} store={:?} surf={}",
+                            self.device.diag_texture_summary(att.texture),
+                            att.load_action,
+                            att.store_action,
+                            att.surface.is_some()
+                        );
+                        (att.texture, s)
+                    });
+                    let interesting = request.color_attachments.iter().flatten().any(|att| {
+                        let fmt = self
+                            .device
+                            .texture_descriptor(att.texture)
+                            .ok()
+                            .map(|d| d.pixel_format);
+                        att.load_action != LoadAction::Clear
+                            || matches!(
+                                fmt,
+                                Some(
+                                    P::Bgra10Xr
+                                        | P::Bgra10XrSrgb
+                                        | P::Rgba16Float
+                                        | P::R16Float
+                                        | P::Rgb10A8_2pXr10
+                                        | P::Rgb10A8_2pXr10Srgb
+                                )
+                            )
+                    });
+                    if interesting && self.diag_draw_count < 90 {
+                        let mut msg = String::from("DIAG PASS");
+                        for (index, att) in request.color_attachments.iter().enumerate() {
+                            if let Some(att) = att {
+                                let d = self.device.texture_descriptor(att.texture).ok();
+                                let _ = core::fmt::Write::write_fmt(
+                                    &mut msg,
+                                    format_args!(
+                                        " c{index}=[{:?} s={} load={:?} store={:?} surf={} res={}]",
+                                        d.as_ref().map(|x| x.pixel_format),
+                                        d.as_ref().map_or(0, |x| x.sample_count),
+                                        att.load_action,
+                                        att.store_action,
+                                        att.surface.is_some(),
+                                        att.resolve.is_some(),
+                                    ),
+                                );
+                            }
+                        }
+                        self.refused.push(msg);
+                    }
+                }
             }
             RenderCode::SetPipeline => {
                 let SetPipeline { pipeline } = payload.record()?;
                 let pipeline = self.object::<RenderPipelineId>(connection, pipeline)?;
+                #[cfg(not(test))]
+                {
+                    self.diag_bound_pipeline = Some(pipeline.0);
+                }
                 commands.set_render_pipeline_state(self.device.render_pipeline_state(pipeline)?)?;
             }
             RenderCode::SetBuffer => {
@@ -78,6 +153,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     index,
                 } = payload.record()?;
                 let buffer = self.optional_buffer(connection, buffer)?;
+                #[cfg(not(test))]
+                if stage != TILE_STAGE && matches!(render_stage(stage), Ok(crate::metal::shader::Stage::Fragment)) {
+                    self.diag_frag_buf.insert(index as u32, format!("buf({buffer:?}+0x{offset:x})"));
+                }
                 if stage == TILE_STAGE {
                     commands.set_tile_buffer(buffer, offset, binding(index)?)?;
                 } else {
@@ -107,6 +186,16 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
             RenderCode::SetBytes => {
                 let (StageBytes { stage, index }, bytes) = payload.split()?;
+                #[cfg(not(test))]
+                if stage != TILE_STAGE && matches!(render_stage(stage), Ok(crate::metal::shader::Stage::Fragment)) {
+                    let b = bytes.bytes();
+                    let mut hex = format!("bytes(len={}:", b.len());
+                    for byte in b.iter().take(32) {
+                        let _ = core::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+                    }
+                    hex.push(')');
+                    self.diag_frag_buf.insert(index as u32, hex);
+                }
                 let resolver = &mut self.device.resolver();
                 if stage == TILE_STAGE {
                     commands.set_tile_bytes(resolver, bytes.bytes(), binding(index)?)?;
@@ -129,6 +218,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 if texture != 0 {
                     let id = self.object::<TextureId>(connection, texture)?;
                     self.device.note_sampled(id);
+                    #[cfg(not(test))]
+                    if let Ok(crate::metal::shader::Stage::Fragment) = render_stage(stage) {
+                        self.diag_frag_tex.insert(index as u32, id);
+                    }
+                } else {
+                    #[cfg(not(test))]
+                    if let Ok(crate::metal::shader::Stage::Fragment) = render_stage(stage) {
+                        self.diag_frag_tex.remove(&(index as u32));
+                    }
                 }
                 let texture = self.texture_id(connection, texture)?;
                 if stage == TILE_STAGE {
@@ -185,6 +283,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                         zfar: record.zfar,
                     })
                     .collect();
+                #[cfg(not(test))]
+                {
+                    self.diag_vp = viewports
+                        .first()
+                        .map_or_else(|| "-".into(), |v| format!("{:.0},{:.0} {}x{}", v.origin_x, v.origin_y, v.width, v.height));
+                }
                 commands.set_viewports(&viewports)?;
             }
             RenderCode::SetScissorRects => {
@@ -198,11 +302,22 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                         height: record.height,
                     })
                     .collect();
+                #[cfg(not(test))]
+                {
+                    self.diag_sc = rects
+                        .first()
+                        .map_or_else(|| "-".into(), |s| format!("{},{} {}x{}", s.x, s.y, s.width, s.height));
+                }
                 commands.set_scissor_rects(&rects)?;
             }
             RenderCode::SetCullMode => {
                 let Mode { mode } = payload.record()?;
-                commands.set_cull_mode(decode(CullMode::from_raw, mode, "cull mode")?)?;
+                let cull = decode(CullMode::from_raw, mode, "cull mode")?;
+                #[cfg(not(test))]
+                {
+                    self.diag_cull = format!("{cull:?}");
+                }
+                commands.set_cull_mode(cull)?;
             }
             RenderCode::SetFrontFacingWinding => {
                 let Mode { mode } = payload.record()?;
@@ -219,6 +334,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
             RenderCode::SetDepthStencilState => {
                 let state = depth_stencil_state(&payload.record()?)?;
+                #[cfg(not(test))]
+                {
+                    self.diag_ds = format!("dw={} dc={:?}", state.depth_write_enable, state.depth_compare_op);
+                }
                 commands.set_depth_stencil_state(Some(&state))?;
             }
             RenderCode::SetTilePipeline => {
@@ -330,6 +449,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
             RenderCode::DrawPrimitives => {
                 let draw: DrawPrimitives = payload.record()?;
+                #[cfg(not(test))]
+                self.diag_note_draw("prim", draw.vertex_count, draw.instance_count);
                 commands.draw_primitives(
                     &mut self.device.resolver(),
                     primitive(draw.primitive)?,
@@ -341,6 +462,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             }
             RenderCode::DrawIndexed => {
                 let draw: DrawIndexed = payload.record()?;
+                #[cfg(not(test))]
+                self.diag_note_draw("idx", draw.index_count, draw.instance_count);
                 let index_buffer = self.buffer_ref(connection, draw.index_buffer)?;
                 let base_vertex = i32::try_from(draw.base_vertex).map_err(|_| {
                     Fault::new(Status::Invalid, "the base vertex exceeds 32 bits")
@@ -626,4 +749,159 @@ fn store_action(raw: u64) -> Result<StoreAction, Fault> {
 
 fn store_options(raw: u64) -> Result<StoreActionOptions, Fault> {
     decode_bits(StoreActionOptions::from_bits, raw, "store action options")
+}
+
+#[cfg(not(test))]
+static DIAG_WS_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(not(test))]
+static DIAG_WS_DRAWS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(test))]
+static DIAG_WS_PROBES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(test))]
+impl<B: Backend, C: Compiler> Service<B, C> {
+    fn diag_note_draw(&mut self, kind: &str, verts: u64, insts: u64) {
+        use core::sync::atomic::Ordering;
+        let Some(pid) = self.diag_bound_pipeline else {
+            return;
+        };
+        let Some((vert, frag, cinfo)) = self.diag_pipelines.get(&pid).cloned() else {
+            return;
+        };
+        let is_blur_or_glass = frag.contains("downsample")
+            || frag.contains("narrow_blur")
+            || frag.contains("variable_blur")
+            || frag.contains("glass_background");
+        let is_ws_trigger = is_blur_or_glass || frag.contains("attachment_clear");
+        if is_ws_trigger {
+            DIAG_WS_SEEN.store(true, Ordering::Relaxed);
+        }
+        let ws_seen = DIAG_WS_SEEN.load(Ordering::Relaxed);
+        let is_rb = frag.contains("uber_fragment")
+            || frag.contains("filter_blur_fragment")
+            || frag.contains("primitive_image_fragment");
+        let is_c0_1280 = self
+            .diag_pass_c0
+            .as_ref()
+            .is_some_and(|x| x.1.contains("1280x800"));
+        let is_large_ws = is_c0_1280 && (!self.diag_frag_tex.is_empty() || frag.contains("attachment_clear"));
+        let interesting = is_blur_or_glass
+            || (is_rb && self.diag_draw_count < 20)
+            || (is_large_ws && (self.diag_draw_count < 10 || ws_seen));
+        if !interesting {
+            return;
+        }
+        let is_wall_or_glass = self.diag_frag_tex.values().any(|&id| {
+            self.device.texture_descriptor(id).is_ok_and(|d| d.width >= 2000)
+        }) || frag.contains("glass_background");
+        static DIAG_WALL_DRAWS: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+        let log_ws = (ws_seen && DIAG_WS_DRAWS.load(Ordering::Relaxed) < 200)
+            || (is_wall_or_glass && DIAG_WALL_DRAWS.load(Ordering::Relaxed) < 30);
+        if self.diag_draw_count < 10 || log_ws {
+            if self.diag_draw_count < 10 {
+                self.diag_draw_count += 1;
+            }
+            let (prefix, seq) = if is_wall_or_glass && DIAG_WS_DRAWS.load(Ordering::Relaxed) >= 200 {
+                ("WALL", DIAG_WALL_DRAWS.fetch_add(1, Ordering::Relaxed) + 1)
+            } else if ws_seen {
+                ("WSDRAW", DIAG_WS_DRAWS.fetch_add(1, Ordering::Relaxed) + 1)
+            } else {
+                ("DRAW", self.diag_draw_count as usize)
+            };
+            let mut msg = format!(
+                "DIAG {prefix} #{seq} {vert}/{frag}[{cinfo}] vp=[{}] sc=[{}] cull=[{}] ds=[{}] {kind}({verts}x{insts}) c0=[{}] c1=[{}] tex=[",
+                self.diag_vp,
+                self.diag_sc,
+                self.diag_cull,
+                self.diag_ds,
+                self.diag_pass_c0.as_ref().map_or("-", |x| x.1.as_str()),
+                self.diag_pass_c1.as_ref().map_or("-", |x| x.1.as_str()),
+            );
+            for (slot, id) in &self.diag_frag_tex {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!(" {slot}:{}", self.device.diag_texture_summary(*id)),
+                );
+            }
+            msg.push_str(" ] fbuf=[");
+            for (slot, summary) in &self.diag_frag_buf {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut msg,
+                    format_args!(" {slot}:{summary}"),
+                );
+            }
+            msg.push_str(" ]");
+            self.refused.push(msg);
+        }
+        let tex_src = self
+            .diag_frag_tex
+            .get(&3)
+            .or_else(|| self.diag_frag_tex.get(&0))
+            .or_else(|| self.diag_frag_tex.values().next())
+            .copied();
+        let tex_desc = tex_src.and_then(|id| self.device.texture_descriptor(id).ok());
+        let tex_w = tex_desc.map_or(0, |d| d.width);
+        let tex_h = tex_desc.map_or(0, |d| d.height);
+        let is_wall = tex_w >= 2000;
+        if is_wall {
+            self.diag_wall_seen = true;
+        }
+        let tex_src4 = self
+            .diag_frag_tex
+            .get(&4)
+            .copied()
+            .filter(|&id| {
+                vert == "fixed_vert_lph_gen"
+                    || self.device
+                        .texture_descriptor(id)
+                        .ok()
+                        .is_some_and(|d| d.width > 1 || d.height > 1)
+            });
+        let post_wall = self.diag_wall_seen
+            && self.diag_wall_probes < 40
+            && (is_wall || is_blur_or_glass || is_large_ws)
+            && !(tex_w == 1 && tex_h == 1);
+        let ws_probe = ws_seen && is_c0_1280 && DIAG_WS_PROBES.load(Ordering::Relaxed) < 25;
+        let is_glass = frag.contains("glass_background");
+        let early_probe = (self.diag_probe_count < 16
+            && (frag.contains("downsample_4_frag")
+                || frag.contains("downsample_8_frag")
+                || is_glass
+                || frag.contains("variable_blur_downsample")))
+            || (is_glass && self.diag_probe_count < 24);
+        if post_wall {
+            self.diag_wall_probes += 1;
+            self.diag_probe_queue.push((
+                format!("W#{}:{}", self.diag_wall_probes, frag),
+                tex_src,
+                tex_src4,
+                self.diag_pass_c0.as_ref().map(|x| x.0),
+            ));
+        } else if ws_probe {
+            let n = DIAG_WS_PROBES.fetch_add(1, Ordering::Relaxed) + 1;
+            self.diag_probe_queue.push((
+                format!("WS#{n}:{frag}"),
+                tex_src,
+                tex_src4,
+                self.diag_pass_c0.as_ref().map(|x| x.0),
+            ));
+            if vert == "fixed_vert_lph_gen" && n <= 8 {
+                self.diag_probe_queue.push((
+                    format!("WS#{n}:AUX9_12"),
+                    self.diag_frag_tex.get(&9).copied(),
+                    self.diag_frag_tex.get(&12).copied(),
+                    None,
+                ));
+            }
+        } else if early_probe {
+            self.diag_probe_count += 1;
+            self.diag_probe_queue.push((
+                format!("#{}:{}", self.diag_probe_count, frag),
+                tex_src,
+                tex_src4,
+                self.diag_pass_c0.as_ref().map(|x| x.0),
+            ));
+        }
+    }
 }

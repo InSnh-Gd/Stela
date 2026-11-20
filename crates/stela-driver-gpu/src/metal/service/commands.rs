@@ -124,11 +124,21 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             Detail::Commit {
                 stream: stream_bytes.len() as u64,
                 uploads: 0,
+                // Filled in by the commit, once the stream replayed.
+                commands: 0,
             },
         );
         let replayed = self.replay_stream(connection, &mut commands, &stream_bytes);
         self.device.timing().since(Phase::CommitReplay, start);
         if let Err(fault) = replayed {
+            #[cfg(not(test))]
+            {
+                self.diag_pass_c0 = None;
+                self.diag_pass_c1 = None;
+                self.diag_bound_pipeline = None;
+                self.diag_frag_tex.clear();
+                self.diag_probe_queue.clear();
+            }
             self.device.discard(commands);
             // A deferred compilation runs the commit again, which submits
             // the command buffer with its events: signaling them now would
@@ -139,6 +149,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             return Err(fault);
         }
         let value = self.device.commit_on(connection.get(), queue, commands)?;
+        #[cfg(not(test))]
+        if !self.diag_probe_queue.is_empty() {
+            let probes = core::mem::take(&mut self.diag_probe_queue);
+            let lines = self.device.diag_wait_and_probe(&probes);
+            for line in lines {
+                self.refused.push(line);
+            }
+        }
         call.reply(&Value { value })
     }
 
@@ -240,6 +258,13 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         match code {
             CommandBufferCode::EndEncoding => {
                 payload.record::<Empty>()?;
+                #[cfg(not(test))]
+                {
+                    self.diag_pass_c0 = None;
+                    self.diag_pass_c1 = None;
+                    self.diag_bound_pipeline = None;
+                    self.diag_frag_tex.clear();
+                }
                 commands.end_encoding(&mut self.device.resolver())?;
             }
             CommandBufferCode::SignalEvent | CommandBufferCode::WaitForEvent => {
